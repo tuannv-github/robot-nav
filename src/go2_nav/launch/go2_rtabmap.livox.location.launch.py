@@ -9,6 +9,16 @@ Odometry: Unitree lidar via ``go2-odom.service`` (``/odom``, TF ``odom`` → ``b
 
 Also starts ``location_publisher`` (same as ``go2_rtabmap.location.launch.py``).
 
+``ran_loc_seed`` publishes the heaviest ``/ran_loc`` position on ``/initialpose``,
+then waits for RTAB-Map's next ICP result on ``/info`` before seeding again.
+Heading is not in ran-loc. Each seed draws a location with probability
+proportional to its weight, and a rejected seed turns the heading 15 degrees.
+The seeder waits for ``/info`` before the next guess. After ICP accepts the
+scan, ran-loc no longer moves the pose. Ran-loc can miss by 10 m, so the
+scan is searched in that region. If the map pose stays farther than 10 m
+from every candidate, or ICP keeps rejecting the scan while the robot is
+moving, the initial pose is set again.
+
 Prerequisites:
     ros2 launch go2_nav realsense.launch.py
     ros2 launch go2_nav livox_mid360.launch.py
@@ -164,13 +174,16 @@ def launch_setup(context, *args, **kwargs):
         'RGBD/ProximityBySpace': 'true',
         'RGBD/ProximityByTime': 'false',
         'RGBD/ProximityMaxGraphDepth': '0',
-        'RGBD/ProximityPathFilteringRadius': '4.0',
-        'RGBD/ProximityMaxPaths': '3',
-        'RGBD/ProximityAngle': '90',
+        # Ran-loc can miss by 10 m and has no heading, so the first match
+        # searches that region and a full turn. The seed node tightens this
+        # after ICP accepts.
+        'RGBD/ProximityPathFilteringRadius': '10.0',
+        'RGBD/ProximityMaxPaths': '8',
+        'RGBD/ProximityAngle': '180',
         'RGBD/ProximityOdomGuess': 'true',
         'RGBD/LoopClosureReextractFeatures': 'false',
         'RGBD/LocalRadius': '15',
-        'RGBD/MaxLocalRetrieved': '2',
+        'RGBD/MaxLocalRetrieved': '8',
         'RGBD/MaxOdomCacheSize': '3',
         'Kp/MaxFeatures': '400',
         'Kp/NndrRatio': '0.8',
@@ -181,13 +194,13 @@ def launch_setup(context, *args, **kwargs):
         'Mem/STMSize': '10',
         # Scan-to-scan refine warps the odom chain and fights map LC; proximity is enough.
         'RGBD/NeighborLinkRefining': 'false',
-        'RGBD/ProximityPathMaxNeighbors': '2' if enable_livox_cloud else '0',
+        'RGBD/ProximityPathMaxNeighbors': '5' if enable_livox_cloud else '0',
         # 1=ICP (Livox). 2=Vis+ICP fails at speed (0 visual inliers). 0=visual.
         'Reg/Strategy': '1' if enable_livox_cloud else '0',
-        'Icp/Iterations': '15',
-        'Icp/MaxCorrespondenceDistance': '1.5',
-        'Icp/MaxTranslation': '2.0',
-        'Icp/MaxRotation': '1.2',
+        'Icp/Iterations': '30',
+        'Icp/MaxCorrespondenceDistance': '10.0',
+        'Icp/MaxTranslation': '10.0',
+        'Icp/MaxRotation': '3.1416',
         'Icp/VoxelSize': '0.12',
         'Icp/RangeMin': '0.5',
     }
@@ -229,6 +242,12 @@ def launch_setup(context, *args, **kwargs):
                 'Mem/InitWMWithAllNodes': 'True',
             }],
             remappings=rtab_remappings,
+        ),
+        Node(
+            package='go2_nav',
+            executable='ran_loc_seed',
+            name='ran_loc_seed',
+            output='screen',
         ),
     ]
 

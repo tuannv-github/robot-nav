@@ -22,6 +22,7 @@ setup(
             os.path.join('go2_nav', 'base_link_project_tf_node.py'),
             os.path.join('go2_nav', 'goal_server_node.py'),
             os.path.join('go2_nav', 'livox_height_filter_node.py'),
+            os.path.join('go2_nav', 'ran_loc_seed_node.py'),
         ]),
     ],
     install_requires=['setuptools'],
@@ -41,6 +42,7 @@ setup(
             'base_link_project_tf = go2_nav.base_link_project_tf_node:main',
             'goal_server = go2_nav.goal_server_node:main',
             'livox_height_filter = go2_nav.livox_height_filter_node:main',
+            'ran_loc_seed = go2_nav.ran_loc_seed_node:main',
         ],
     },
 )

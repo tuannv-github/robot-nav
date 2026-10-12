@@ -23,6 +23,8 @@
   <exec_depend>rtabmap_odom</exec_depend>
   <exec_depend>rtabmap_slam</exec_depend>
   <exec_depend>rtabmap_sync</exec_depend>
+  <exec_depend>rtabmap_msgs</exec_depend>
+  <exec_depend>go2_controller_msgs</exec_depend>
 
   <!-- Optional: used when filter_imu:=true -->
   <exec_depend>imu_filter_madgwick</exec_depend>

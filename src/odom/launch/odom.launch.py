@@ -23,6 +23,9 @@ _FASTDDS_XML = os.environ.get(
     'FASTRTPS_DEFAULT_PROFILES_FILE',
     os.path.expanduser('/tmp/fastrtps.odom-ext.xml'),
 )
+_LO_URI = os.environ.get(
+    'CYCLONEDDS_LO_URI', f'file://{_REPO}/cyclonedds/cyclonedds.local.xml'
+)
 
 
 def generate_launch_description():
@@ -35,6 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument('publish_tf', default_value='true'),
         DeclareLaunchArgument('use_ros_time', default_value='true'),
         DeclareLaunchArgument('relay_pipe', default_value='/tmp/go2_odom.fifo'),
+        DeclareLaunchArgument('tf_lo_pipe', default_value='/tmp/go2_tf_lo.fifo'),
         DeclareLaunchArgument('reset_flag', default_value='/tmp/go2_odom.reset'),
         Node(
             package='odom',
@@ -77,6 +81,43 @@ def generate_launch_description():
                 'publish_tf': ParameterValue(LaunchConfiguration('publish_tf'), value_type=bool),
                 'relay_pipe': LaunchConfiguration('relay_pipe'),
                 'reset_flag': LaunchConfiguration('reset_flag'),
+            }],
+        ),
+        # eth0 tap + lo publisher: rviz2-local (lo only) can see odom -> base_link.
+        # Do not put both interfaces in one process; that is the Unitree SPDP failure.
+        Node(
+            package='odom',
+            executable='odom_tf_eth_tap',
+            name='odom_tf_eth_tap',
+            output='screen',
+            respawn=True,
+            respawn_delay=3.0,
+            additional_env={
+                'RMW_IMPLEMENTATION': 'rmw_cyclonedds_cpp',
+                'CYCLONEDDS_URI': _ETH0_URI,
+                'FASTRTPS_DEFAULT_PROFILES_FILE': '',
+            },
+            parameters=[{
+                'relay_pipe': LaunchConfiguration('tf_lo_pipe'),
+                'odom_frame': LaunchConfiguration('odom_frame'),
+                'base_frame': LaunchConfiguration('base_frame'),
+            }],
+        ),
+        Node(
+            package='odom',
+            executable='odom_tf_lo',
+            name='odom_tf_lo',
+            output='screen',
+            respawn=True,
+            respawn_delay=3.0,
+            additional_env={
+                'RMW_IMPLEMENTATION': 'rmw_cyclonedds_cpp',
+                'CYCLONEDDS_URI': _LO_URI,
+                'FASTRTPS_DEFAULT_PROFILES_FILE': '',
+                'ROS_LOCALHOST_ONLY': '0',
+            },
+            parameters=[{
+                'relay_pipe': LaunchConfiguration('tf_lo_pipe'),
             }],
         ),
     ])
