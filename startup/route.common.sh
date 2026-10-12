@@ -12,6 +12,8 @@ ROUTE_ALL_DESTINATIONS=(
     "$IP_VIDEO_MQTT_BROKER"
     "$IP_LLM_SERVER"
     "$IP_LOCATION_SERVER"
+    10.1.101.211
+    10.1.101.220
 )
 
 route_delete_all() {

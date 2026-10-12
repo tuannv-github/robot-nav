@@ -31,5 +31,7 @@ tmux_stack_reset_window "$SESSION" llm "$VLAA_APP_ROBOTS" \
 tmux_stack_reset_window "$SESSION" monitor "$SCRIPT_DIR" \
     "bash \"$SCRIPT_DIR/system-monitor.sh\""
 
+tmux_stack_reset_window "$SESSION" 5g "$SCRIPT_DIR" "nload 5g"
+
 tmux select-pane -t "$SESSION:main.0"
 tmux_stack_attach "$SESSION"

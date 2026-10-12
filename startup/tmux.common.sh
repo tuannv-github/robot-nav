@@ -65,6 +65,29 @@ _tmux_stack_pkill() {
     pkill -f "$1" 2>/dev/null || true
 }
 
+# SIGTERM, then SIGKILL anything still matching. VLAA's speaker catches SIGINT/SIGTERM
+# and outlives the tmux pane, so it keeps the USB speaker after a stack restart.
+_tmux_stack_pkill_finish() {
+    local pattern alive i
+    for pattern in "$@"; do
+        _tmux_stack_pkill "$pattern"
+    done
+    for i in 1 2 3 4 5; do
+        alive=0
+        for pattern in "$@"; do
+            if pgrep -f "$pattern" >/dev/null 2>&1; then
+                alive=1
+                break
+            fi
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 0.3
+    done
+    for pattern in "$@"; do
+        pkill -9 -f "$pattern" 2>/dev/null || true
+    done
+}
+
 _tmux_stack_pkill_controller() {
     _tmux_stack_pkill '[r]un_mqtt_to_ros2\.sh'
     _tmux_stack_pkill '[r]un_go2_controller\.sh'
@@ -97,13 +120,14 @@ _tmux_stack_pkill_map_realsense() {
 }
 
 _tmux_stack_pkill_llm() {
-    _tmux_stack_pkill '[a]pp_robots/main\.py'
-    _tmux_stack_pkill '[p]ython3 main\.py --robot-model'
-    _tmux_stack_pkill '[r]un_vlaa\.sh'
-    _tmux_stack_pkill '[a]udio_recorder'
-    _tmux_stack_pkill '[a]udio_speaker'
-    _tmux_stack_pkill '[w]ifi-heartbeat\.sh'
-    _tmux_stack_pkill '[s]ystem-monitor\.sh'
+    _tmux_stack_pkill_finish \
+        '[a]pp_robots/main\.py' \
+        '[p]ython3 main\.py --robot-model' \
+        '[r]un_vlaa\.sh' \
+        '[a]udio_recorder' \
+        '[a]udio_speaker' \
+        '[w]ifi-heartbeat\.sh' \
+        '[s]ystem-monitor\.sh'
 }
 
 _tmux_stack_pkill_remote() {

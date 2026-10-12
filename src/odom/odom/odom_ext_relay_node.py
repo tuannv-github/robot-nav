@@ -49,7 +49,7 @@ class OdomExtRelay(Node):
         self._fifo = FifoReader(pipe)
         self._reset_flag = Path(reset_flag)
         self.create_service(Empty, '~/reset', self._on_reset)
-        self.create_timer(0.005, self._poll)
+        self.create_timer(0.05, self._poll)
 
         self.get_logger().info(
             f'ext /odom relay listening fifo {pipe} -> {topic}; '
@@ -74,26 +74,27 @@ class OdomExtRelay(Node):
         except OSError as exc:
             self.get_logger().warn(f'relay fifo: {exc}')
             return
-        for data in frames:
-            try:
-                msg = deserialize_message(data, Odometry)
-            except Exception as exc:  # noqa: BLE001
-                self.get_logger().warn(f'relay deserialize: {exc}')
-                continue
-            self._n += 1
-            self._pub.publish(msg)
-            if self._n == 1 or self._n % 200 == 0:
-                self.get_logger().info(f'ext published /odom n={self._n}')
-            if self._tf is None:
-                continue
-            t = TransformStamped()
-            t.header = msg.header
-            t.child_frame_id = msg.child_frame_id
-            t.transform.translation.x = msg.pose.pose.position.x
-            t.transform.translation.y = msg.pose.pose.position.y
-            t.transform.translation.z = msg.pose.pose.position.z
-            t.transform.rotation = msg.pose.pose.orientation
-            self._tf.sendTransform(t)
+        if not frames:
+            return
+        try:
+            msg = deserialize_message(frames[-1], Odometry)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'relay deserialize: {exc}')
+            return
+        self._n += 1
+        self._pub.publish(msg)
+        if self._n == 1 or self._n % 40 == 0:
+            self.get_logger().info(f'ext published /odom n={self._n}')
+        if self._tf is None:
+            return
+        t = TransformStamped()
+        t.header = msg.header
+        t.child_frame_id = msg.child_frame_id
+        t.transform.translation.x = msg.pose.pose.position.x
+        t.transform.translation.y = msg.pose.pose.position.y
+        t.transform.translation.z = msg.pose.pose.position.z
+        t.transform.rotation = msg.pose.pose.orientation
+        self._tf.sendTransform(t)
 
 
 def main(args=None) -> None:

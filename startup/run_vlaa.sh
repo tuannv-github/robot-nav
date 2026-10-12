@@ -216,6 +216,54 @@ else
     warn "wait_for_blink500b2.sh not found under $VLAA_APP_ROBOTS/app_go2/setup; skipping."
 fi
 
+# A SIGKILL during the previous shutdown can leave the YunChen speaker's
+# isochronous endpoint running with hw_ptr stuck. PipeWire still shows the
+# sink as RUNNING, but nothing is played. Reset only in that case.
+speaker_playback_stuck() {
+    local card status state hw1 hw2
+    card="$(awk '/USB Composite Device/ {print $1; exit}' /proc/asound/cards)"
+    [ -n "$card" ] || return 1
+    status="/proc/asound/card${card}/pcm0p/sub0/status"
+    [ -r "$status" ] || return 1
+    state="$(awk '/^state:/ {print $2}' "$status")"
+    [ "$state" = "RUNNING" ] || return 1
+    hw1="$(awk '/^hw_ptr/ {print $3}' "$status")"
+    sleep 0.4
+    hw2="$(awk '/^hw_ptr/ {print $3}' "$status")"
+    [ "$hw1" = "$hw2" ]
+}
+
+reset_usb_speaker() {
+    local dev vendor product name
+    for dev in /sys/bus/usb/devices/*; do
+        [ -f "${dev}/idVendor" ] || continue
+        vendor="$(cat "${dev}/idVendor" 2>/dev/null || true)"
+        product="$(cat "${dev}/idProduct" 2>/dev/null || true)"
+        [ "$vendor" = "0909" ] && [ "$product" = "005b" ] || continue
+        name="$(basename "$dev")"
+        log "Resetting USB speaker ${name} (0909:005b)"
+        if sudo sh -c "echo 0 > '${dev}/authorized' && sleep 0.4 && echo 1 > '${dev}/authorized'"; then
+            sleep 1
+            if systemctl --user restart pipewire pipewire-pulse pipewire-media-session 2>/dev/null; then
+                log "Restarted PipeWire after speaker reset."
+                sleep 1
+            fi
+            return 0
+        fi
+        warn "Could not reset USB speaker ${name}"
+        return 1
+    done
+    warn "USB speaker 0909:005b not found; skip reset"
+    return 0
+}
+
+if speaker_playback_stuck; then
+    warn "USB speaker playback pointer is not moving; resetting it."
+    reset_usb_speaker || true
+else
+    log "USB speaker playback is moving; not resetting."
+fi
+
 # Hand the cards over to VLAA, then start it. Background python so we keep a
 # pid for clean shutdown via the EXIT/TERM traps above.
 set_card_suspend 1

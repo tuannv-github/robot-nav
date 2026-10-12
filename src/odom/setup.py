@@ -24,7 +24,6 @@ setup(
         'console_scripts': [
             'utlidar_odom = odom.utlidar_odom_node:main',
             'odom_ext_relay = odom.odom_ext_relay_node:main',
-            'odom_tf_eth_tap = odom.lo_tf_relay:tap_main',
             'odom_tf_lo = odom.lo_tf_relay:pub_main',
         ],
     },

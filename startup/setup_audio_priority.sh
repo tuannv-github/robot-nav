@@ -84,8 +84,17 @@ fi
 
 restart_pulse_for_user() {
     local user="$1"
-    local uid
+    local uid server
     uid="$(id -u "$user" 2>/dev/null)" || return 0
+
+    # This Jetson session is PipeWire (pipewire-pulse). pulseaudio -k / --start
+    # either hits that socket or leaves a second daemon beside it, and the USB
+    # speaker stays with PipeWire instead of the new VLAA process.
+    server="$(sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$uid" pactl info 2>/dev/null | awk -F': ' '/^Server Name:/ {print $2; exit}')"
+    if [[ "$server" == *PipeWire* ]]; then
+        log "Session audio for $user is PipeWire; not starting PulseAudio."
+        return 0
+    fi
 
     if command -v systemctl >/dev/null 2>&1; then
         if sudo -u "$user" XDG_RUNTIME_DIR="/run/user/$uid" \

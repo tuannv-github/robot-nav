@@ -36,6 +36,7 @@ def generate_launch_description():
         DeclareLaunchArgument('base_frame', default_value='base_link'),
         DeclareLaunchArgument('zero_at_start', default_value='true'),
         DeclareLaunchArgument('publish_tf', default_value='true'),
+        DeclareLaunchArgument('output_rate_hz', default_value='20.0'),
         DeclareLaunchArgument('use_ros_time', default_value='true'),
         DeclareLaunchArgument('relay_pipe', default_value='/tmp/go2_odom.fifo'),
         DeclareLaunchArgument('tf_lo_pipe', default_value='/tmp/go2_tf_lo.fifo'),
@@ -58,7 +59,11 @@ def generate_launch_description():
                 'publish_tf': ParameterValue(LaunchConfiguration('publish_tf'), value_type=bool),
                 'use_ros_time': ParameterValue(LaunchConfiguration('use_ros_time'), value_type=bool),
                 'relay_pipe': LaunchConfiguration('relay_pipe'),
+                'tf_lo_pipe': LaunchConfiguration('tf_lo_pipe'),
                 'reset_flag': LaunchConfiguration('reset_flag'),
+                'output_rate_hz': ParameterValue(
+                    LaunchConfiguration('output_rate_hz'), value_type=float
+                ),
             }],
         ),
         Node(
@@ -83,26 +88,7 @@ def generate_launch_description():
                 'reset_flag': LaunchConfiguration('reset_flag'),
             }],
         ),
-        # eth0 tap + lo publisher: rviz2-local (lo only) can see odom -> base_link.
-        # Do not put both interfaces in one process; that is the Unitree SPDP failure.
-        Node(
-            package='odom',
-            executable='odom_tf_eth_tap',
-            name='odom_tf_eth_tap',
-            output='screen',
-            respawn=True,
-            respawn_delay=3.0,
-            additional_env={
-                'RMW_IMPLEMENTATION': 'rmw_cyclonedds_cpp',
-                'CYCLONEDDS_URI': _ETH0_URI,
-                'FASTRTPS_DEFAULT_PROFILES_FILE': '',
-            },
-            parameters=[{
-                'relay_pipe': LaunchConfiguration('tf_lo_pipe'),
-                'odom_frame': LaunchConfiguration('odom_frame'),
-                'base_frame': LaunchConfiguration('base_frame'),
-            }],
-        ),
+        # Loopback copy of the 20 Hz transform. utlidar_odom stays on eth0.
         Node(
             package='odom',
             executable='odom_tf_lo',
