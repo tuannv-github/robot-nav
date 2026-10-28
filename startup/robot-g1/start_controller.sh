@@ -18,6 +18,8 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BRIDGE="${PROJECT_DIR}/src/g1_controller/scripts/g1_controller_bridge.py"
 CONSOLE_DIR="${PROJECT_DIR}/src/g1_controller/console/web"
 SDK_DIR="${G1_SDK_DIR:-${PROJECT_DIR}/../3thrdparties/unitree_sdk2_python}"
+VIDEO_SRC="${PROJECT_DIR}/../services/video-src/stream_g1_front.py"
+export G1_MEDIAMTX_HOST="${G1_MEDIAMTX_HOST:-10.1.101.173}"
 
 export G1_CONSOLE_DIR="${CONSOLE_DIR}"
 export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -40,7 +42,7 @@ pick_python() {
     if [[ "${candidate}" != "python3" && ! -x "${candidate}" ]]; then
       continue
     fi
-    if "${candidate}" -c "import unitree_sdk2py, uvicorn, starlette" >/dev/null 2>&1; then
+    if "${candidate}" -c "import unitree_sdk2py, uvicorn, starlette, websockets, zmq" >/dev/null 2>&1; then
       echo "${candidate}"
       return 0
     fi
@@ -54,9 +56,9 @@ if [[ ! -f "${BRIDGE}" ]]; then
 fi
 
 if ! PYTHON="$(pick_python)"; then
-  echo "error: no Python with unitree_sdk2py, uvicorn, and starlette" >&2
+  echo "error: no Python with unitree_sdk2py, uvicorn, starlette, websockets, and pyzmq" >&2
   echo "  SDK expected at ${SDK_DIR}" >&2
-  echo "  pip install --user 'cyclonedds' 'uvicorn' 'starlette'" >&2
+  echo "  pip install --user 'cyclonedds' 'uvicorn' 'starlette' 'websockets' 'pyzmq'" >&2
   exit 1
 fi
 
@@ -78,7 +80,7 @@ stop_existing_controller() {
   local pid killed=0
   local -a pids=()
 
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller" || true)
+  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     if kill -0 "${pid}" 2>/dev/null; then
@@ -97,7 +99,7 @@ stop_existing_controller() {
   local i
   for i in $(seq 1 25); do
     local still=0
-    mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller" || true)
+    mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py" || true)
     for pid in "${pids[@]}"; do
       [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
       if kill -0 "${pid}" 2>/dev/null; then
@@ -111,7 +113,7 @@ stop_existing_controller() {
   done
 
   echo "Existing G1 controller did not exit; sending SIGKILL..."
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller" || true)
+  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     kill -9 "${pid}" 2>/dev/null || true
@@ -120,6 +122,11 @@ stop_existing_controller() {
 }
 
 stop_existing_controller
+
+if [[ -f "${VIDEO_SRC}" ]]; then
+  echo "Starting BRIO stream -> whip://${G1_MEDIAMTX_HOST}:8889/stream/g1/front"
+  nohup /usr/bin/python3 "${VIDEO_SRC}" --host "${G1_MEDIAMTX_HOST}" >/tmp/g1-video-src.log 2>&1 &
+fi
 
 if [[ -f "${PROJECT_DIR}/install/setup.bash" ]] && command -v ros2 >/dev/null 2>&1; then
   # shellcheck source=/dev/null

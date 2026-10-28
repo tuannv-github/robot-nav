@@ -128,12 +128,14 @@ function ModeChoice({ mode, fsmId, busy, offline, onSelect, compact }) {
   );
 }
 
+const PAD_MISS_LIMIT = 5;
+
 function connectedPads() {
   const raw = navigator.getGamepads ? navigator.getGamepads() : [];
   const found = [];
   for (let i = 0; i < raw.length; i += 1) {
     const gp = raw[i];
-    if (gp && gp.connected && gp.axes && gp.axes.length >= 2) found.push(gp);
+    if (gp && gp.connected) found.push(gp);
   }
   return found;
 }
@@ -181,6 +183,9 @@ function ControlTab({ state, actions }) {
   const joyBook = React.useRef({ pads: "", axis: {}, button: {} });
   const joySeq = React.useRef(1);
   const [joyEvents, setJoyEvents] = React.useState([]);
+  const padCache = React.useRef({});
+  const padGrace = React.useRef(false);
+  const stickHold = React.useRef(null);
 
   function pushJoy(kind, name, detail) {
     const id = joySeq.current;
@@ -188,9 +193,33 @@ function ControlTab({ state, actions }) {
     setJoyEvents((prev) => prev.concat([{ id, ts: Date.now(), kind, name, detail }]).slice(-400));
   }
 
-  function sampleJoysticks(pads) {
+  function stablePads(pads) {
+    const live = {};
+    pads.forEach((gp) => {
+      const index = String(gp.index);
+      live[index] = true;
+      padCache.current[index] = {
+        index,
+        label: padLabel(gp),
+        id: gp.id || "",
+        misses: 0,
+      };
+    });
+    if (!document.hidden) {
+      Object.keys(padCache.current).forEach((index) => {
+        if (live[index]) return;
+        padCache.current[index].misses += 1;
+        if (padCache.current[index].misses >= PAD_MISS_LIMIT) delete padCache.current[index];
+      });
+    }
+    return Object.keys(padCache.current)
+      .sort((a, b) => Number(a) - Number(b))
+      .map((index) => padCache.current[index]);
+  }
+
+  function sampleJoysticks(pads, stable) {
     const book = joyBook.current;
-    const sig = pads.map((gp) => gp.index + "\t" + padLabel(gp)).join("\n");
+    const sig = stable.map((item) => item.index + "\t" + item.label).join("\n");
     if (sig !== book.pads) {
       const prevRows = book.pads ? book.pads.split("\n") : [];
       const nextRows = sig ? sig.split("\n") : [];
@@ -213,9 +242,10 @@ function ControlTab({ state, actions }) {
       book.pads = sig;
     }
     const live = {};
+    stable.forEach((item) => { live[item.index] = true; });
     pads.forEach((gp) => {
-      live[gp.index] = true;
-      const axis = (index) => (gp.axes.length > index ? gp.axes[index] : 0);
+      live[String(gp.index)] = true;
+      const axis = (index) => (gp.axes && gp.axes.length > index ? gp.axes[index] : 0);
       const rounded = [axis(0), -axis(1), axis(2), -axis(3)].map((value) => Math.round(value * 100) / 100);
       const key = rounded.join(",");
       if (book.axis[gp.index] !== key) {
@@ -252,7 +282,7 @@ function ControlTab({ state, actions }) {
       }
     });
     Object.keys(book.axis).forEach((id) => {
-      if (!live[id]) {
+      if (!live[String(id)]) {
         delete book.axis[id];
         delete book.button[id];
       }
@@ -260,6 +290,10 @@ function ControlTab({ state, actions }) {
   }
 
   const applyAxes = React.useCallback(() => {
+    if (!joyOnRef.current) {
+      axes.current = { lx: 0, ly: 0, rx: 0, ry: 0 };
+      return;
+    }
     let lx = 0;
     let ly = 0;
     let rx = 0;
@@ -280,14 +314,21 @@ function ControlTab({ state, actions }) {
       rx += rightPad.current.x;
       ry += rightPad.current.y;
     }
-    if (joyOnRef.current) {
+    if (joyOnRef.current && joyIndexRef.current) {
       const gp = connectedPads().find((item) => String(item.index) === joyIndexRef.current);
+      const axis = (index) => (gp && gp.axes && gp.axes.length > index ? gp.axes[index] : 0);
       if (gp) {
-        const axis = (index) => (gp.axes.length > index ? gp.axes[index] : 0);
-        lx += axis(0);
-        ly += -axis(1);
-        if (gp.axes.length > 2) rx += axis(2);
-        if (gp.axes.length > 3) ry += -axis(3);
+        const held = { lx: axis(0), ly: -axis(1), rx: axis(2), ry: -axis(3) };
+        stickHold.current = held;
+        lx += held.lx;
+        ly += held.ly;
+        rx += held.rx;
+        ry += held.ry;
+      } else if (padGrace.current && stickHold.current) {
+        lx += stickHold.current.lx;
+        ly += stickHold.current.ly;
+        rx += stickHold.current.rx;
+        ry += stickHold.current.ry;
       }
     }
     const clamp = (v) => Math.max(-1, Math.min(1, v));
@@ -300,23 +341,30 @@ function ControlTab({ state, actions }) {
     async function tick() {
       if (dead) return;
       const pads = connectedPads();
-      sampleJoysticks(pads);
-      const sig = pads.map((gp) => gp.index + "\t" + gp.id).join("\n");
+      const stable = stablePads(pads);
+      const selected = joyIndexRef.current;
+      padGrace.current = !document.hidden && !!selected
+        && stable.some((item) => item.index === selected)
+        && !pads.some((gp) => String(gp.index) === selected);
+      sampleJoysticks(pads, stable);
+      const sig = stable.map((item) => item.index + "\t" + item.id).join("\n");
       if (sig !== padsSig.current) {
         padsSig.current = sig;
-        setJoyPads(pads.map((gp) => ({ index: String(gp.index), label: padLabel(gp) })));
+        setJoyPads(stable.map((item) => ({ index: item.index, label: item.label })));
       }
-      if (joyIndexRef.current && !pads.some((gp) => String(gp.index) === joyIndexRef.current)) {
+      if (selected && !stable.some((item) => item.index === selected)) {
         joyIndexRef.current = "";
         setJoyIndex("");
+        stickHold.current = null;
+        padGrace.current = false;
         if (joyOnRef.current) {
           joyOnRef.current = false;
           setJoyOn(false);
           lastSig.current = "";
           bridgeHalt();
         }
-      } else if (!joyIndexRef.current && pads.length === 1) {
-        joyIndexRef.current = String(pads[0].index);
+      } else if (!joyIndexRef.current && stable.length === 1) {
+        joyIndexRef.current = stable[0].index;
         setJoyIndex(joyIndexRef.current);
         joyOnRef.current = true;
         setJoyOn(true);
@@ -467,6 +515,9 @@ function ControlTab({ state, actions }) {
     joyOnRef.current = next;
     setJoyOn(next);
     if (!next) {
+      keys.current.clear();
+      leftPad.current = { x: 0, y: 0, active: false };
+      rightPad.current = { x: 0, y: 0, active: false };
       lastSig.current = "";
       bridgeHalt();
     }
@@ -594,7 +645,15 @@ function ControlTab({ state, actions }) {
         <Card className="board-card">
           <div className="panel-head">
             <SectionLabel kicker={driveMode === "sport" ? "m/s" : "gain"}>Drive</SectionLabel>
-            <StatusDot state={joyOn && joyIndex ? "ok" : linkState} label={joyOn && joyIndex ? "Joystick on" : (state.linkDetail || "Offline")} />
+            <button
+              type="button"
+              className="status-btn"
+              aria-pressed={joyOn}
+              disabled={offline && !joyOn}
+              onClick={toggleJoystick}
+            >
+              <StatusDot state={joyOn ? "ok" : "warn"} label={joyOn ? "On" : "Off"} />
+            </button>
           </div>
           <div className="drive-tools">
             <select
@@ -613,7 +672,8 @@ function ControlTab({ state, actions }) {
               <button
                 type="button"
                 className={"mode-chip" + (joyOn ? " is-selected" : "")}
-                disabled={offline || !joyIndex}
+                aria-pressed={joyOn}
+                disabled={offline && !joyOn}
                 onClick={toggleJoystick}
               >
                 <strong>{joyOn ? "On" : "Off"}</strong>

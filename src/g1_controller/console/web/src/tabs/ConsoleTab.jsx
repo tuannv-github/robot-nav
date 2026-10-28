@@ -1,5 +1,13 @@
 // tabs/ConsoleTab.jsx — action log shared by the control screen.
 
+function ifaceLabel(source) {
+  if (source === "http" || source === "wireless" || source === "cmd_vel") return "HTTP";
+  if (source === "ws" || source === "control") return "WS";
+  if (source === "zmq") return "ZMQ";
+  if (source === "hold") return "Hold";
+  return source || "";
+}
+
 const KIND_LABEL = {
   mode: "Mode",
   sport: "Sport",
@@ -73,6 +81,9 @@ function ActionLogPanel({ state }) {
             </span>
             <span className="feed-text">
               <strong>{entry.name}</strong>
+              {entry.kind === "drive" && entry.source ? (
+                <span className="console-source">{ifaceLabel(entry.source)}</span>
+              ) : null}
               {entry.detail ? <span className="console-detail">{entry.detail}</span> : null}
             </span>
           </div>

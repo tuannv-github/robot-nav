@@ -56,7 +56,7 @@ function App() {
   const actions = useMemo(() => ({ setState, goToTab: setTab }), []);
   const activeTab = tabs.find((x) => x.id === tab) || tabs[0];
   const TabComp = activeTab ? window[activeTab.component] : null;
-  const fit = activeTab?.id === "control";
+  const fit = activeTab?.id === "control" || activeTab?.id === "video";
   const appClass = "app " + (dark ? "theme-dark" : "theme-light") + " density-comfy";
   const appVars = {
     "--accent": colors.accent,
