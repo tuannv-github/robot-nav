@@ -53,6 +53,7 @@ FSM_NAMES = {
 
 LINEAR_SCALE = 0.6
 YAW_SCALE = 1.0
+HTTP_CLIENT_SEC = 3.0
 HOLD_TIMEOUT_SEC = 0.45
 HOLD_PERIOD_SEC = 0.2
 VELOCITY_DURATION_SEC = 0.5
@@ -226,6 +227,36 @@ def _default_interfaces() -> dict:
     }
 
 
+class HttpClients:
+    """Distinct HTTP clients that have called the controller in the last few seconds."""
+
+    def __init__(self):
+        self._seen: dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def touch(self, client) -> None:
+        if not client:
+            return
+        host = str(client[0])
+        if not host:
+            return
+        now = time.time()
+        with self._lock:
+            self._seen[host] = now
+            self._drop(now)
+
+    def count(self) -> int:
+        now = time.time()
+        with self._lock:
+            self._drop(now)
+            return len(self._seen)
+
+    def _drop(self, now: float) -> None:
+        stale = [host for host, seen in self._seen.items() if now - seen > HTTP_CLIENT_SEC]
+        for host in stale:
+            del self._seen[host]
+
+
 class InterfaceStore:
     """SQLite record of the HTTP, WebSocket, and ZMQ control interfaces."""
 
@@ -372,8 +403,11 @@ class ZmqInterface:
         self.endpoint = ""
         self.running = False
         self.error = ""
+        self._peers: set[int] = set()
+        self._peer_lock = threading.Lock()
         self._stop = threading.Event()
         self._ready = threading.Event()
+        self._mon = None
         self._thread: threading.Thread | None = None
         self._ctx = None
         self._sock = None
@@ -400,9 +434,16 @@ class ZmqInterface:
     def close(self) -> None:
         self._stop.set()
         sock = self._sock
+        mon = self._mon
         ctx = self._ctx
         self._sock = None
+        self._mon = None
         self._ctx = None
+        if mon is not None:
+            try:
+                mon.close(linger=0)
+            except Exception:
+                pass
         if sock is not None:
             try:
                 sock.close(linger=0)
@@ -418,6 +459,39 @@ class ZmqInterface:
             thread.join(timeout=1.0)
         self._thread = None
         self.running = False
+        with self._peer_lock:
+            self._peers.clear()
+
+    def connections(self) -> int:
+        with self._peer_lock:
+            return len(self._peers)
+
+    def _note_peer(self, event: int, value: int, zmq) -> None:
+        connected = (zmq.EVENT_ACCEPTED,)
+        gone = (zmq.EVENT_DISCONNECTED, zmq.EVENT_CLOSED)
+        if value <= 0:
+            return
+        with self._peer_lock:
+            if event in connected:
+                self._peers.add(value)
+            elif event in gone:
+                self._peers.discard(value)
+
+    def _read_monitor(self, mon, zmq) -> None:
+        from zmq.utils.monitor import recv_monitor_message
+
+        while True:
+            try:
+                msg = recv_monitor_message(mon, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                return
+            except Exception:
+                return
+            try:
+                value = int(msg.get("value") or 0)
+            except (TypeError, ValueError):
+                value = 0
+            self._note_peer(int(msg.get("event") or 0), value, zmq)
 
     def _run(self, endpoint: str) -> None:
         try:
@@ -431,6 +505,14 @@ class ZmqInterface:
         sock = ctx.socket(zmq.PULL)
         sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt(zmq.RCVTIMEO, 200)
+        monitor = "inproc://g1-zmq-%s" % id(sock)
+        flags = zmq.EVENT_ACCEPTED | zmq.EVENT_DISCONNECTED | zmq.EVENT_CLOSED
+        if hasattr(zmq, "EVENT_HANDSHAKE_SUCCEEDED"):
+            flags |= zmq.EVENT_HANDSHAKE_SUCCEEDED
+        try:
+            sock.monitor(monitor, flags)
+        except Exception:
+            monitor = ""
         try:
             sock.bind(endpoint)
         except Exception as exc:
@@ -445,12 +527,33 @@ class ZmqInterface:
             return
         self._ctx = ctx
         self._sock = sock
+        mon = None
+        if monitor:
+            mon = ctx.socket(zmq.PAIR)
+            try:
+                mon.connect(monitor)
+            except Exception:
+                mon.close(linger=0)
+                mon = None
+        self._mon = mon
         self.running = True
         self.error = ""
         self._ready.set()
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+        if mon is not None:
+            poller.register(mon, zmq.POLLIN)
         while not self._stop.is_set():
             try:
-                raw = sock.recv()
+                ready = dict(poller.poll(200))
+            except Exception:
+                break
+            if mon is not None and mon in ready:
+                self._read_monitor(mon, zmq)
+            if sock not in ready:
+                continue
+            try:
+                raw = sock.recv(zmq.NOBLOCK)
             except zmq.Again:
                 continue
             except Exception:
@@ -476,6 +579,7 @@ class G1Controller:
         self.network_interface = network_interface
         self.actions = ActionLog(_action_log_path())
         self.interfaces = InterfaceStore(_config_db_path())
+        self.http_clients = HttpClients()
         self.zmq_iface = ZmqInterface(self)
         self.bind_host = ""
         self.bind_port = 0
@@ -614,6 +718,22 @@ class G1Controller:
                 "w": hold["w"],
             },
             "error": self.last_error,
+            "links": self.link_status(),
+        }
+
+    def link_status(self) -> dict:
+        hub = getattr(self, "control_hub", None)
+        return {
+            "http": {"up": True, "connections": self.http_clients.count()},
+            "ws": {
+                "up": bool(hub and hub.enabled),
+                "connections": hub.count() if hub is not None else 0,
+            },
+            "zmq": {
+                "up": bool(self.zmq_iface.running),
+                "connections": self.zmq_iface.connections(),
+                "error": self.zmq_iface.error,
+            },
         }
 
     def set_stick(self, lx: float, ly: float, rx: float, source: str = "wireless") -> None:
@@ -989,6 +1109,10 @@ class ControlHub:
         self._lock = threading.Lock()
         self._loop = None
 
+    def count(self) -> int:
+        with self._lock:
+            return len(self._sockets)
+
     def bind(self, loop) -> None:
         self._loop = loop
 
@@ -1328,12 +1452,23 @@ def build_app(robot: G1Controller):
         print(f"operator console directory {console_dir}", flush=True)
 
     app = Starlette(routes=routes)
+
+    class _RememberHttpClient:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http":
+                robot.http_clients.touch(scope.get("client"))
+            await self.app(scope, receive, send)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(_RememberHttpClient)
     return app
 
 

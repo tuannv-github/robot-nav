@@ -18,7 +18,7 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BRIDGE="${PROJECT_DIR}/src/g1_controller/scripts/g1_controller_bridge.py"
 CONSOLE_DIR="${PROJECT_DIR}/src/g1_controller/console/web"
 SDK_DIR="${G1_SDK_DIR:-${PROJECT_DIR}/../3thrdparties/unitree_sdk2_python}"
-VIDEO_SRC="${PROJECT_DIR}/../services/video-src/stream_g1_front.py"
+VIDEO_SRC="${PROJECT_DIR}/services/video-src/stream_g1_front.py"
 export G1_MEDIAMTX_HOST="${G1_MEDIAMTX_HOST:-10.1.101.173}"
 
 export G1_CONSOLE_DIR="${CONSOLE_DIR}"

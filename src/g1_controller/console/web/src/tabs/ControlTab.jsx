@@ -128,8 +128,6 @@ function ModeChoice({ mode, fsmId, busy, offline, onSelect, compact }) {
   );
 }
 
-const PAD_MISS_LIMIT = 5;
-
 function connectedPads() {
   const raw = navigator.getGamepads ? navigator.getGamepads() : [];
   const found = [];
@@ -153,10 +151,14 @@ function joyButtonName(index) {
   return JOY_BUTTONS[i] || ("B" + i);
 }
 
+function buttonDown(button) {
+  if (!button) return false;
+  if (button.pressed) return true;
+  return typeof button.value === "number" && button.value >= 0.5;
+}
+
 function startDown(gp) {
-  if (!gp.buttons) return false;
-  const indexes = gp.mapping === "standard" ? [9] : [9, 7];
-  return indexes.some((index) => gp.buttons[index] && gp.buttons[index].pressed);
+  return buttonDown(gp.buttons && gp.buttons[9]);
 }
 
 function ControlTab({ state, actions }) {
@@ -185,7 +187,9 @@ function ControlTab({ state, actions }) {
   const [joyEvents, setJoyEvents] = React.useState([]);
   const padCache = React.useRef({});
   const padGrace = React.useRef(false);
+  const padSeenAt = React.useRef(0);
   const stickHold = React.useRef(null);
+  const poseSig = React.useRef("");
 
   function pushJoy(kind, name, detail) {
     const id = joySeq.current;
@@ -193,33 +197,48 @@ function ControlTab({ state, actions }) {
     setJoyEvents((prev) => prev.concat([{ id, ts: Date.now(), kind, name, detail }]).slice(-400));
   }
 
-  function stablePads(pads) {
-    const live = {};
-    pads.forEach((gp) => {
-      const index = String(gp.index);
-      live[index] = true;
-      padCache.current[index] = {
-        index,
-        label: padLabel(gp),
-        id: gp.id || "",
-        misses: 0,
-      };
-    });
-    if (!document.hidden) {
-      Object.keys(padCache.current).forEach((index) => {
-        if (live[index]) return;
-        padCache.current[index].misses += 1;
-        if (padCache.current[index].misses >= PAD_MISS_LIMIT) delete padCache.current[index];
+  function rememberPad(gp) {
+    const index = String(gp.index);
+    const id = gp.id || "";
+    if (id) {
+      Object.keys(padCache.current).forEach((key) => {
+        if (key !== index && padCache.current[key].id === id) {
+          if (joyIndexRef.current === key) {
+            joyIndexRef.current = index;
+            setJoyIndex(index);
+          }
+          delete padCache.current[key];
+        }
       });
     }
+    padCache.current[index] = {
+      index,
+      label: padLabel(gp),
+      id,
+    };
+  }
+
+  function listPads() {
     return Object.keys(padCache.current)
       .sort((a, b) => Number(a) - Number(b))
       .map((index) => padCache.current[index]);
   }
 
+  function scanPads() {
+    const raw = navigator.getGamepads ? navigator.getGamepads() : [];
+    const found = [];
+    for (let i = 0; i < raw.length; i += 1) {
+      const gp = raw[i];
+      if (!gp || gp.connected === false) continue;
+      rememberPad(gp);
+      found.push(gp);
+    }
+    return found;
+  }
+
   function sampleJoysticks(pads, stable) {
     const book = joyBook.current;
-    const sig = stable.map((item) => item.index + "\t" + item.label).join("\n");
+    const sig = stable.map((item) => (item.id || item.index) + "\t" + item.label).join("\n");
     if (sig !== book.pads) {
       const prevRows = book.pads ? book.pads.split("\n") : [];
       const nextRows = sig ? sig.split("\n") : [];
@@ -266,19 +285,18 @@ function ControlTab({ state, actions }) {
       const pressed = [];
       const buttons = gp.buttons || [];
       for (let i = 0; i < buttons.length; i += 1) {
-        if (buttons[i] && buttons[i].pressed) pressed.push(String(i));
+        if (buttonDown(buttons[i])) pressed.push(String(i));
       }
       const buttonSig = pressed.join(",");
       if (book.button[gp.index] !== buttonSig) {
         const previous = book.button[gp.index] == null ? [] : book.button[gp.index].split(",").filter(Boolean);
         const first = book.button[gp.index] == null;
         book.button[gp.index] = buttonSig;
-        if (!first) {
-          const down = pressed.filter((index) => previous.indexOf(index) < 0);
-          const up = previous.filter((index) => pressed.indexOf(index) < 0);
-          if (down.length) pushJoy("button", down.map(joyButtonName).join(" "), "down");
-          if (up.length) pushJoy("button", up.map(joyButtonName).join(" "), "up");
-        }
+        const now = pressed;
+        const down = first ? now : now.filter((index) => previous.indexOf(index) < 0);
+        const up = first ? [] : previous.filter((index) => now.indexOf(index) < 0);
+        if (down.length) pushJoy("button", down.map(joyButtonName).join(" "), "down");
+        if (up.length) pushJoy("button", up.map(joyButtonName).join(" "), "up");
       }
     });
     Object.keys(book.axis).forEach((id) => {
@@ -287,6 +305,45 @@ function ControlTab({ state, actions }) {
         delete book.button[id];
       }
     });
+  }
+
+  function showPose(pads) {
+    const gp = pads.find((item) => String(item.index) === joyIndexRef.current) || (pads.length === 1 ? pads[0] : null);
+    if (!gp) return;
+    const axis = (index) => (gp.axes && gp.axes.length > index ? gp.axes[index] : 0);
+    const pose = {
+      left: { x: axis(0), y: -axis(1) },
+      right: { x: axis(2), y: -axis(3) },
+    };
+    const key = [pose.left.x, pose.left.y, pose.right.x, pose.right.y].map((value) => Math.round(value * 100)).join(",");
+    if (key === poseSig.current) return;
+    poseSig.current = key;
+    setKnobs(pose);
+  }
+
+  function noteStart(pads) {
+    let starter = null;
+    pads.forEach((gp) => {
+      if (startDown(gp)) starter = gp;
+    });
+    if (starter && !startWas.current) {
+      joyIndexRef.current = String(starter.index);
+      setJoyIndex(joyIndexRef.current);
+      const next = !joyOnRef.current;
+      joyOnRef.current = next;
+      setJoyOn(next);
+      if (!next) {
+        lastSig.current = "";
+        bridgeHalt();
+      }
+    }
+    startWas.current = !!starter;
+  }
+
+  function observePads(pads) {
+    sampleJoysticks(pads, listPads());
+    showPose(pads);
+    noteStart(pads);
   }
 
   const applyAxes = React.useCallback(() => {
@@ -340,59 +397,50 @@ function ControlTab({ state, actions }) {
 
     async function tick() {
       if (dead) return;
-      const pads = connectedPads();
-      const stable = stablePads(pads);
+      const pads = scanPads();
+      const stable = listPads();
       const selected = joyIndexRef.current;
-      padGrace.current = !document.hidden && !!selected
-        && stable.some((item) => item.index === selected)
-        && !pads.some((gp) => String(gp.index) === selected);
+      const liveNow = !!selected && pads.some((gp) => String(gp.index) === selected);
+      if (pads.length === 1 && String(pads[0].index) !== selected) {
+        const hadSelection = !!selected;
+        joyIndexRef.current = String(pads[0].index);
+        setJoyIndex(joyIndexRef.current);
+        if (!hadSelection) {
+          joyOnRef.current = true;
+          setJoyOn(true);
+        }
+      } else if (selected && !liveNow) {
+        const previousId = (padCache.current[selected] || {}).id;
+        const rebound = previousId && pads.find((gp) => gp.id === previousId);
+        if (rebound) {
+          joyIndexRef.current = String(rebound.index);
+          setJoyIndex(joyIndexRef.current);
+        }
+      }
+      if (liveNow || pads.some((gp) => String(gp.index) === joyIndexRef.current)) {
+        padSeenAt.current = Date.now();
+      }
+      padGrace.current = !!joyIndexRef.current
+        && !pads.some((gp) => String(gp.index) === joyIndexRef.current)
+        && !!stickHold.current
+        && (Date.now() - padSeenAt.current) < 300;
       sampleJoysticks(pads, stable);
       const sig = stable.map((item) => item.index + "\t" + item.id).join("\n");
       if (sig !== padsSig.current) {
         padsSig.current = sig;
         setJoyPads(stable.map((item) => ({ index: item.index, label: item.label })));
       }
-      if (selected && !stable.some((item) => item.index === selected)) {
-        joyIndexRef.current = "";
-        setJoyIndex("");
-        stickHold.current = null;
-        padGrace.current = false;
-        if (joyOnRef.current) {
-          joyOnRef.current = false;
-          setJoyOn(false);
-          lastSig.current = "";
-          bridgeHalt();
-        }
-      } else if (!joyIndexRef.current && stable.length === 1) {
-        joyIndexRef.current = stable[0].index;
-        setJoyIndex(joyIndexRef.current);
-        joyOnRef.current = true;
-        setJoyOn(true);
-      }
-      let starter = null;
-      pads.forEach((gp) => {
-        if (startDown(gp)) starter = gp;
-      });
-      if (starter && !startWas.current) {
-        joyIndexRef.current = String(starter.index);
-        setJoyIndex(joyIndexRef.current);
-        const next = !joyOnRef.current;
-        joyOnRef.current = next;
-        setJoyOn(next);
-        if (!next) {
-          lastSig.current = "";
-          bridgeHalt();
-        }
-      }
-      startWas.current = !!starter;
+      noteStart(pads);
       applyAxes();
       const a = axes.current;
       const s = stateRef.current || {};
       const driveMode = s.driveMode === "sport" ? "sport" : "stick";
-      setKnobs({
-        left: { x: a.lx, y: a.ly },
-        right: { x: a.rx, y: a.ry },
-      });
+      if (!joyIndexRef.current) {
+        setKnobs({
+          left: { x: a.lx, y: a.ly },
+          right: { x: a.rx, y: a.ry },
+        });
+      }
 
       if (driveMode === "sport") {
         const speed = Number(s.speed);
@@ -481,12 +529,36 @@ function ControlTab({ state, actions }) {
       keys.current.delete(event.key.toLowerCase());
     }
 
+    function onPadConnect(event) {
+      const gp = event && event.gamepad;
+      if (!gp || gp.connected === false) return;
+      rememberPad(gp);
+      const pads = scanPads();
+      const seen = pads.some((item) => item.index === gp.index);
+      observePads(seen ? pads : pads.concat([gp]));
+      if (seen) {
+        sampleJoysticks([gp], listPads());
+        noteStart([gp]);
+      }
+    }
+
+    let frame = 0;
+    function watchPads() {
+      if (dead) return;
+      observePads(scanPads());
+      frame = window.requestAnimationFrame(watchPads);
+    }
+
     const id = setInterval(tick, 100);
+    frame = window.requestAnimationFrame(watchPads);
+    window.addEventListener("gamepadconnected", onPadConnect);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     return () => {
       dead = true;
       clearInterval(id);
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("gamepadconnected", onPadConnect);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       bridgeHalt();
@@ -598,6 +670,25 @@ function ControlTab({ state, actions }) {
   const driveMode = state.driveMode === "sport" ? "sport" : "stick";
   const linkState = offline ? "bad" : "ok";
   const shown = driveMode === "sport" ? state.sport || {} : state.stick || {};
+  const links = (state.health && state.health.links) || null;
+  const linkCards = [
+    { id: "http", label: "HTTP" },
+    { id: "ws", label: "WebSocket" },
+    { id: "zmq", label: "ZMQ" },
+  ].map((item) => {
+    const row = links && links[item.id];
+    if (offline || !row) {
+      return { ...item, state: offline ? "bad" : "warn", count: "—", title: item.label };
+    }
+    const up = !!row.up;
+    const count = row.connections == null ? 0 : row.connections;
+    return {
+      ...item,
+      state: up ? "ok" : "bad",
+      count: String(count),
+      title: row.error ? item.label + " " + row.error : item.label + (up ? " up" : " down"),
+    };
+  });
 
   function knobStyle(stick) {
     return {
@@ -609,6 +700,14 @@ function ControlTab({ state, actions }) {
   return (
     <div className="board">
       <div className="board-top">
+        <div className="link-row" aria-label="Interface connections">
+          {linkCards.map((item) => (
+            <div className="link-cell" key={item.id} title={item.title}>
+              <StatusDot state={item.state} label={item.label} />
+              <span className="link-n">{item.count}</span>
+            </div>
+          ))}
+        </div>
         <Card className="board-card">
           <div className="panel-head">
             <SectionLabel kicker={fsmId == null ? "fsm" : String(fsmId)}>{fsmName}</SectionLabel>
