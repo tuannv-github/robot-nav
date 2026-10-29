@@ -15,6 +15,8 @@ const BRINGUP = [
     slug: "damping",
     name: "Damping",
     fsm: [1],
+    confirmFrom: [500, 501, 801, 802],
+    confirm: "Switch from walking to Damping? Balance stops and the robot softens.",
     desc: "Soft hold. Allowed from any mode. Remote: L2 + B.",
   },
   {
@@ -161,8 +163,248 @@ function startDown(gp) {
   return buttonDown(gp.buttons && gp.buttons[9]);
 }
 
+const ODOM_CHOICES = [
+  { id: "pelvis", name: "Pelvis" },
+  { id: "torso", name: "Torso" },
+  { id: "odom", name: "Odom mode" },
+  { id: "fusion", name: "Fusion" },
+  { id: "fusion-torso", name: "Fusion torso" },
+];
+
+function degFromRad(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return number * 180 / Math.PI;
+}
+
+function odomGrow(view, x, y) {
+  const extent = Math.max(Math.abs(x - view.x), Math.abs(y - view.y));
+  const limit = 1.5 * (2 ** 16);
+  while (extent > view.span / 2 && view.span < limit) view.span *= 2;
+}
+
+function odomFrameFrom(view) {
+  if (!view) {
+    return { minX: -0.75, maxX: 0.75, minY: -0.75, maxY: 0.75, span: 1.5 };
+  }
+  const half = view.span / 2;
+  return {
+    minX: view.x - half,
+    maxX: view.x + half,
+    minY: view.y - half,
+    maxY: view.y + half,
+    span: view.span,
+  };
+}
+
+function odomToSvg(point, frame) {
+  const spanX = frame.maxX - frame.minX || 1;
+  const spanY = frame.maxY - frame.minY || 1;
+  const pad = 18;
+  const size = 200;
+  return {
+    x: pad + ((point.x - frame.minX) / spanX) * (size - pad * 2),
+    y: size - pad - ((point.y - frame.minY) / spanY) * (size - pad * 2),
+  };
+}
+
+function OdomPlot({ points, head, frame }) {
+  const drawn = points.length ? points : [];
+  const span = frame.span;
+  const grid = [];
+  for (let i = 1; i <= 3; i += 1) {
+    const at = 18 + ((200 - 36) * i) / 4;
+    grid.push(at);
+  }
+  const path = drawn.map((point) => {
+    const xy = odomToSvg(point, frame);
+    return xy.x.toFixed(1) + "," + xy.y.toFixed(1);
+  }).join(" ");
+  const tipLen = Math.max(span * 0.07, 0.12);
+  let mark = "";
+  if (head) {
+    const yaw = Number.isFinite(head.yaw) ? head.yaw : 0;
+    const nose = odomToSvg({
+      x: head.x + Math.cos(yaw) * tipLen,
+      y: head.y + Math.sin(yaw) * tipLen,
+    }, frame);
+    const left = odomToSvg({
+      x: head.x + Math.cos(yaw + 2.6) * tipLen * 0.45,
+      y: head.y + Math.sin(yaw + 2.6) * tipLen * 0.45,
+    }, frame);
+    const right = odomToSvg({
+      x: head.x + Math.cos(yaw - 2.6) * tipLen * 0.45,
+      y: head.y + Math.sin(yaw - 2.6) * tipLen * 0.45,
+    }, frame);
+    mark = nose.x.toFixed(1) + "," + nose.y.toFixed(1)
+      + " " + left.x.toFixed(1) + "," + left.y.toFixed(1)
+      + " " + right.x.toFixed(1) + "," + right.y.toFixed(1);
+  }
+  const start = drawn.length ? odomToSvg(drawn[0], frame) : null;
+  const origin = odomToSvg({ x: 0, y: 0 }, frame);
+  const originIn = origin.x >= 16 && origin.x <= 184 && origin.y >= 16 && origin.y <= 184;
+
+  return (
+    <svg className="odom-plot" viewBox="0 0 200 200" role="img" aria-label="Odometry path, top view. Origin at 0, 0, 0.">
+      <rect className="odom-plot-bg" x="0" y="0" width="200" height="200" rx="10" />
+      {grid.map((at) => (
+        <g key={at} className="odom-grid-line">
+          <line x1={at} y1="18" x2={at} y2="182" />
+          <line x1="18" y1={at} x2="182" y2={at} />
+        </g>
+      ))}
+      {originIn ? (
+        <g className="odom-origin">
+          <line x1="18" y1={origin.y} x2="182" y2={origin.y} />
+          <line x1={origin.x} y1="18" x2={origin.x} y2="182" />
+          <circle cx={origin.x} cy={origin.y} r="3.2" />
+          <text x={origin.x + 6} y={origin.y - 6}>0, 0, 0</text>
+        </g>
+      ) : null}
+      {path ? <polyline className="odom-path" points={path} /> : null}
+      {start ? <circle className="odom-start" cx={start.x} cy={start.y} r="2.2" /> : null}
+      {mark ? <polygon className="odom-head" points={mark} /> : null}
+      <text className="odom-axis" x="18" y="196">{fmtNumber(frame.minX, frame.span <= 1.5 ? 2 : 1)}</text>
+      <text className="odom-axis" x="182" y="196" textAnchor="end">{fmtNumber(frame.maxX, frame.span <= 1.5 ? 2 : 1)}</text>
+      <text className="odom-axis" x="6" y="22">{fmtNumber(frame.maxY, frame.span <= 1.5 ? 2 : 1)}</text>
+      {!head ? <text className="odom-empty" x="100" y="104" textAnchor="middle">Waiting for a sample</text> : null}
+    </svg>
+  );
+}
+
+function OdomBox() {
+  const [sourceId, setSourceId] = React.useState(() => {
+    try {
+      return window.localStorage.getItem("g1.odomSource") || "pelvis";
+    } catch (err) {
+      return "pelvis";
+    }
+  });
+  const [feed, setFeed] = React.useState(null);
+  const trails = React.useRef({});
+  const views = React.useRef({});
+  const [draw, setDraw] = React.useState({ id: "pelvis", points: [], head: null });
+
+  React.useEffect(() => {
+    let stop = false;
+
+    async function tick() {
+      try {
+        const body = await bridgeSend("/odom");
+        if (!stop) setFeed(body);
+      } catch (err) {
+        if (!stop) setFeed(null);
+      }
+    }
+
+    tick();
+    const id = setInterval(tick, 200);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+  }, []);
+
+  React.useEffect(() => {
+    const sources = (feed && feed.sources) || [];
+    const sample = sources.find((item) => item.id === sourceId);
+    if (!sample || !sample.position) {
+      setDraw((prev) => (
+        prev.id === sourceId && !prev.head
+          ? prev
+          : { id: sourceId, points: trails.current[sourceId] || [], head: null }
+      ));
+      return;
+    }
+    const head = {
+      x: Number(sample.position[0]),
+      y: Number(sample.position[1]),
+      z: Number(sample.position[2]),
+      yaw: sample.rpy ? Number(sample.rpy[2]) : 0,
+    };
+    const list = trails.current[sourceId] || (trails.current[sourceId] = []);
+    if (!views.current[sourceId]) {
+      views.current[sourceId] = { x: 0, y: 0, span: 1.5 };
+    }
+    odomGrow(views.current[sourceId], head.x, head.y);
+    const last = list[list.length - 1];
+    const moved = !last || Math.hypot(head.x - last.x, head.y - last.y) >= 0.01;
+    if (moved) {
+      list.push({ x: head.x, y: head.y, yaw: head.yaw });
+      if (list.length > 800) list.splice(0, list.length - 800);
+    } else {
+      last.x = head.x;
+      last.y = head.y;
+      last.yaw = head.yaw;
+    }
+    setDraw({ id: sourceId, points: list, head });
+  }, [feed, sourceId]);
+
+  function chooseSource(value) {
+    setSourceId(value);
+    const points = trails.current[value] || [];
+    setDraw({ id: value, points, head: points[points.length - 1] || null });
+    try {
+      window.localStorage.setItem("g1.odomSource", value);
+    } catch (err) {
+      /* the box still switches for this visit */
+    }
+  }
+
+  function clearPath() {
+    trails.current[sourceId] = [];
+    delete views.current[sourceId];
+    setDraw((prev) => ({ id: sourceId, points: [], head: prev.head }));
+  }
+
+  const sources = (feed && feed.sources) || [];
+  const choices = sources.length ? sources : ODOM_CHOICES;
+  const selected = sources.find((item) => item.id === sourceId) || null;
+  const live = !!(selected && selected.live);
+  const shown = draw.id === sourceId ? draw : { points: [], head: null };
+  const frames = selected && selected.frame_id && selected.child_frame_id
+    ? selected.frame_id + " → " + selected.child_frame_id
+    : "";
+  let status = "bad";
+  let statusLabel = "Offline";
+  if (feed) {
+    status = live ? "ok" : (selected && selected.position ? "warn" : "bad");
+    statusLabel = live ? "Live" : "Silent";
+  }
+  const pose = shown.head;
+
+  return (
+    <Card className="board-card odom-card">
+      <div className="panel-head">
+        <SectionLabel kicker={live && selected.hz ? selected.hz + " Hz" : "odom"}>Odometry</SectionLabel>
+        <StatusDot state={status} label={statusLabel} />
+      </div>
+      <select
+        className="joy-select"
+        aria-label="Odometry source"
+        value={choices.some((item) => item.id === sourceId) ? sourceId : "pelvis"}
+        onChange={(event) => chooseSource(event.target.value)}
+      >
+        {choices.map((item) => (
+          <option key={item.id} value={item.id}>{item.name}</option>
+        ))}
+      </select>
+      <div className="odom-meta">
+        <p className="odom-topic">{frames || (selected && selected.topic) || "Waiting for the robot"}</p>
+        <button type="button" className="odom-clear" onClick={clearPath}>Clear path</button>
+      </div>
+      <p className="odom-pose mono">
+        <span>x {pose ? fmtNumber(pose.x, 2) : "—"}</span>
+        <span>y {pose ? fmtNumber(pose.y, 2) : "—"}</span>
+        <span>z {pose && Number.isFinite(pose.z) ? fmtNumber(pose.z, 2) : "—"}</span>
+        <span>yaw {pose ? fmtNumber(degFromRad(pose.yaw), 0) + "°" : "—"}</span>
+      </p>
+      <OdomPlot points={shown.points} head={pose} frame={odomFrameFrom(views.current[sourceId])} />
+    </Card>
+  );
+}
+
 function ControlTab({ state, actions }) {
-  useBridgeLive(actions);
   const stateRef = React.useRef(state);
   stateRef.current = state;
   const keys = React.useRef(new Set());
@@ -326,18 +568,26 @@ function ControlTab({ state, actions }) {
     pads.forEach((gp) => {
       if (startDown(gp)) starter = gp;
     });
-    if (starter && !startWas.current) {
+      if (starter && !startWas.current) {
       joyIndexRef.current = String(starter.index);
       setJoyIndex(joyIndexRef.current);
       const next = !joyOnRef.current;
       joyOnRef.current = next;
       setJoyOn(next);
+      setGrab(next);
       if (!next) {
         lastSig.current = "";
         bridgeHalt();
       }
     }
     startWas.current = !!starter;
+  }
+
+  function setGrab(on) {
+    bridgeSend("/wireless", {
+      method: "POST",
+      body: JSON.stringify({ grab: !!on }),
+    }).catch(() => null);
   }
 
   function observePads(pads) {
@@ -376,12 +626,21 @@ function ControlTab({ state, actions }) {
       const axis = (index) => (gp && gp.axes && gp.axes.length > index ? gp.axes[index] : 0);
       if (gp) {
         const held = { lx: axis(0), ly: -axis(1), rx: axis(2), ry: -axis(3) };
-        stickHold.current = held;
-        lx += held.lx;
-        ly += held.ly;
-        rx += held.rx;
-        ry += held.ry;
-      } else if (padGrace.current && stickHold.current) {
+        const idle = Math.abs(held.lx) + Math.abs(held.ly) + Math.abs(held.rx) + Math.abs(held.ry) < 0.02;
+        const blurred = !document.hasFocus() || document.hidden;
+        if (idle && blurred && stickHold.current) {
+          lx += stickHold.current.lx;
+          ly += stickHold.current.ly;
+          rx += stickHold.current.rx;
+          ry += stickHold.current.ry;
+        } else {
+          stickHold.current = held;
+          lx += held.lx;
+          ly += held.ly;
+          rx += held.rx;
+          ry += held.ry;
+        }
+      } else if (stickHold.current && (padGrace.current || !document.hasFocus() || document.hidden)) {
         lx += stickHold.current.lx;
         ly += stickHold.current.ly;
         rx += stickHold.current.rx;
@@ -394,8 +653,9 @@ function ControlTab({ state, actions }) {
 
   React.useEffect(() => {
     let dead = false;
+    let sending = false;
 
-    async function tick() {
+    function tick() {
       if (dead) return;
       const pads = scanPads();
       const stable = listPads();
@@ -422,8 +682,7 @@ function ControlTab({ state, actions }) {
       }
       padGrace.current = !!joyIndexRef.current
         && !pads.some((gp) => String(gp.index) === joyIndexRef.current)
-        && !!stickHold.current
-        && (Date.now() - padSeenAt.current) < 300;
+        && !!padCache.current[joyIndexRef.current];
       sampleJoysticks(pads, stable);
       const sig = stable.map((item) => item.index + "\t" + item.id).join("\n");
       if (sig !== padsSig.current) {
@@ -455,19 +714,16 @@ function ControlTab({ state, actions }) {
         } else {
           lastSig.current = "sport";
         }
-        try {
-          if (!active) {
-            await bridgeSend("/cmd_vel/stop", { method: "POST" });
-          } else {
-            await bridgeSend("/cmd_vel", {
-              method: "POST",
-              body: JSON.stringify({ vx, vy, w }),
-            });
-          }
+        if (sending) return;
+        sending = true;
+        const sportSend = active
+          ? bridgeSend("/cmd_vel", { method: "POST", body: JSON.stringify({ vx, vy, w }) })
+          : bridgeSend("/cmd_vel/stop", { method: "POST" });
+        sportSend.then(() => {
           if (!dead) actions.setState((prev) => ({ ...prev, sport: { vx, vy, w }, notice: "" }));
-        } catch (err) {
+        }).catch((err) => {
           if (!dead) actions.setState((prev) => ({ ...prev, notice: err.message || "Sport command failed" }));
-        }
+        }).then(() => { sending = false; });
         return;
       }
 
@@ -485,19 +741,19 @@ function ControlTab({ state, actions }) {
       } else {
         lastSig.current = "stick";
       }
-      try {
-        if (!active) {
-          await bridgeHalt();
-        } else {
-          await bridgeSend("/wireless", {
-            method: "POST",
-            body: JSON.stringify({ lx, ly, rx, ry: a.ry * moveGain, keys: 0 }),
-          });
-        }
+      if (sending) return;
+      sending = true;
+      const stickSend = active
+        ? bridgeSend("/wireless", {
+          method: "POST",
+          body: JSON.stringify({ lx, ly, rx, ry: a.ry * moveGain, keys: 0 }),
+        })
+        : bridgeHalt();
+      stickSend.then(() => {
         if (!dead) actions.setState((prev) => ({ ...prev, stick: { lx, ly, rx }, notice: "" }));
-      } catch (err) {
+      }).catch((err) => {
         if (!dead) actions.setState((prev) => ({ ...prev, notice: err.message || "Stick command failed" }));
-      }
+      }).then(() => { sending = false; });
     }
 
     function typing(event) {
@@ -515,6 +771,7 @@ function ControlTab({ state, actions }) {
         lastSig.current = "";
         joyOnRef.current = false;
         setJoyOn(false);
+        setGrab(false);
         bridgeHalt();
         return;
       }
@@ -542,6 +799,10 @@ function ControlTab({ state, actions }) {
       }
     }
 
+    function onFocusLost() {
+      keys.current.clear();
+    }
+
     let frame = 0;
     function watchPads() {
       if (dead) return;
@@ -549,18 +810,23 @@ function ControlTab({ state, actions }) {
       frame = window.requestAnimationFrame(watchPads);
     }
 
-    const id = setInterval(tick, 100);
+    const stopClock = startDriveClock(tick, 50);
+    const stopKeepAlive = startDriveKeepAlive();
+    if (joyOnRef.current) setGrab(true);
     frame = window.requestAnimationFrame(watchPads);
     window.addEventListener("gamepadconnected", onPadConnect);
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onFocusLost);
     return () => {
       dead = true;
-      clearInterval(id);
+      stopClock();
+      stopKeepAlive();
       window.cancelAnimationFrame(frame);
       window.removeEventListener("gamepadconnected", onPadConnect);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onFocusLost);
       bridgeHalt();
     };
   }, [actions, applyAxes]);
@@ -577,6 +843,7 @@ function ControlTab({ state, actions }) {
     if (!value && joyOnRef.current) {
       joyOnRef.current = false;
       setJoyOn(false);
+      setGrab(false);
       lastSig.current = "";
       bridgeHalt();
     }
@@ -586,6 +853,7 @@ function ControlTab({ state, actions }) {
     const next = !joyOnRef.current;
     joyOnRef.current = next;
     setJoyOn(next);
+    setGrab(next);
     if (!next) {
       keys.current.clear();
       leftPad.current = { x: 0, y: 0, active: false };
@@ -649,7 +917,9 @@ function ControlTab({ state, actions }) {
   }
 
   async function selectMode(mode) {
-    if (mode.confirm && !window.confirm(mode.confirm)) return;
+    const fromWalk = mode.confirmFrom && mode.confirmFrom.indexOf(fsmId) >= 0;
+    const prompt = mode.confirm && (!mode.confirmFrom || fromWalk) ? mode.confirm : "";
+    if (prompt && !window.confirm(prompt)) return;
     setModeBusy(mode.slug);
     try {
       const body = await bridgeSend("/sport/" + mode.slug, { method: "POST", body: "{}" });
@@ -664,31 +934,51 @@ function ControlTab({ state, actions }) {
     }
   }
 
+  const scaleTimer = React.useRef(0);
+  const scaleRef = React.useRef({
+    moveGain: state.moveGain,
+    turnGain: state.turnGain,
+    speed: state.speed,
+  });
+
+  React.useEffect(() => {
+    let stop = false;
+    bridgeSend("/config/scale").then((body) => {
+      if (stop || !body) return;
+      const loaded = {
+        moveGain: Number(body.move),
+        turnGain: Number(body.turn),
+        speed: Number(body.speed),
+      };
+      scaleRef.current = loaded;
+      actions.setState((prev) => ({ ...prev, ...loaded }));
+    }).catch(() => {});
+    return () => { stop = true; };
+  }, [actions]);
+
+  function setScale(patch) {
+    scaleRef.current = { ...scaleRef.current, ...patch };
+    actions.setState((prev) => ({ ...prev, ...patch }));
+    window.clearTimeout(scaleTimer.current);
+    const pending = scaleRef.current;
+    scaleTimer.current = window.setTimeout(() => {
+      bridgeSend("/config/scale", {
+        method: "PUT",
+        body: JSON.stringify({
+          move: pending.moveGain,
+          turn: pending.turnGain,
+          speed: pending.speed,
+        }),
+      }).catch(() => {});
+    }, 300);
+  }
+
   const fsmId = state.health && state.health.fsm_id != null ? Number(state.health.fsm_id) : null;
   const fsmName = fsmLabel(state.health, "Unknown");
   const offline = state.link !== "live";
   const driveMode = state.driveMode === "sport" ? "sport" : "stick";
   const linkState = offline ? "bad" : "ok";
   const shown = driveMode === "sport" ? state.sport || {} : state.stick || {};
-  const links = (state.health && state.health.links) || null;
-  const linkCards = [
-    { id: "http", label: "HTTP" },
-    { id: "ws", label: "WebSocket" },
-    { id: "zmq", label: "ZMQ" },
-  ].map((item) => {
-    const row = links && links[item.id];
-    if (offline || !row) {
-      return { ...item, state: offline ? "bad" : "warn", count: "—", title: item.label };
-    }
-    const up = !!row.up;
-    const count = row.connections == null ? 0 : row.connections;
-    return {
-      ...item,
-      state: up ? "ok" : "bad",
-      count: String(count),
-      title: row.error ? item.label + " " + row.error : item.label + (up ? " up" : " down"),
-    };
-  });
 
   function knobStyle(stick) {
     return {
@@ -700,14 +990,6 @@ function ControlTab({ state, actions }) {
   return (
     <div className="board">
       <div className="board-top">
-        <div className="link-row" aria-label="Interface connections">
-          {linkCards.map((item) => (
-            <div className="link-cell" key={item.id} title={item.title}>
-              <StatusDot state={item.state} label={item.label} />
-              <span className="link-n">{item.count}</span>
-            </div>
-          ))}
-        </div>
         <Card className="board-card">
           <div className="panel-head">
             <SectionLabel kicker={fsmId == null ? "fsm" : String(fsmId)}>{fsmName}</SectionLabel>
@@ -741,20 +1023,9 @@ function ControlTab({ state, actions }) {
             ))}
           </div>
         </Card>
-        <Card className="board-card">
-          <div className="panel-head">
+        <Card className="board-card drive-card">
+          <div className="panel-head drive-head">
             <SectionLabel kicker={driveMode === "sport" ? "m/s" : "gain"}>Drive</SectionLabel>
-            <button
-              type="button"
-              className="status-btn"
-              aria-pressed={joyOn}
-              disabled={offline && !joyOn}
-              onClick={toggleJoystick}
-            >
-              <StatusDot state={joyOn ? "ok" : "warn"} label={joyOn ? "On" : "Off"} />
-            </button>
-          </div>
-          <div className="drive-tools">
             <select
               className="joy-select"
               aria-label="Detected joysticks"
@@ -795,38 +1066,36 @@ function ControlTab({ state, actions }) {
               </button>
             </div>
           </div>
+          <div className="drive-body">
           <div className="pad-row board-pads">
-            <div className="pad-col">
-              <span className="pad-label">Move</span>
-              <div
-                className="pad"
-                role="application"
-                aria-label="Left stick. Drag to walk and strafe. W A S D."
-                onPointerDown={onLeftPad}
-                onPointerMove={(event) => { if (leftPad.current.active) onLeftPad(event); }}
-                onPointerUp={() => { leftPad.current = { x: 0, y: 0, active: false }; }}
-                onPointerCancel={() => { leftPad.current = { x: 0, y: 0, active: false }; }}
-              >
-                <span className="pad-cross" />
-                <span className="pad-knob" style={knobStyle(knobs.left)} />
-              </div>
+            <div
+              className="pad"
+              role="application"
+              aria-label="Move. Drag to walk and strafe. W A S D."
+              onPointerDown={onLeftPad}
+              onPointerMove={(event) => { if (leftPad.current.active) onLeftPad(event); }}
+              onPointerUp={() => { leftPad.current = { x: 0, y: 0, active: false }; }}
+              onPointerCancel={() => { leftPad.current = { x: 0, y: 0, active: false }; }}
+            >
+              <span className="pad-name">Move</span>
+              <span className="pad-cross" />
+              <span className="pad-knob" style={knobStyle(knobs.left)} />
             </div>
-            <div className="pad-col">
-              <span className="pad-label">Turn</span>
-              <div
-                className="pad"
-                role="application"
-                aria-label="Right stick. Drag left or right to turn. Q E."
-                onPointerDown={onRightPad}
-                onPointerMove={(event) => { if (rightPad.current.active) onRightPad(event); }}
-                onPointerUp={() => { rightPad.current = { x: 0, y: 0, active: false }; }}
-                onPointerCancel={() => { rightPad.current = { x: 0, y: 0, active: false }; }}
-              >
-                <span className="pad-cross" />
-                <span className="pad-knob" style={knobStyle(knobs.right)} />
-              </div>
+            <div
+              className="pad"
+              role="application"
+              aria-label="Turn. Drag left or right to turn. Q E."
+              onPointerDown={onRightPad}
+              onPointerMove={(event) => { if (rightPad.current.active) onRightPad(event); }}
+              onPointerUp={() => { rightPad.current = { x: 0, y: 0, active: false }; }}
+              onPointerCancel={() => { rightPad.current = { x: 0, y: 0, active: false }; }}
+            >
+              <span className="pad-name">Turn</span>
+              <span className="pad-cross" />
+              <span className="pad-knob" style={knobStyle(knobs.right)} />
             </div>
           </div>
+          <div className="drive-side">
           <div className="drive-gains">
             {driveMode === "sport" ? (
               <label className="gain-row">
@@ -838,9 +1107,7 @@ function ControlTab({ state, actions }) {
                   max="0.6"
                   step="0.05"
                   value={state.speed}
-                  onChange={(event) => {
-                    actions.setState((prev) => ({ ...prev, speed: Number(event.target.value) }));
-                  }}
+                  onChange={(event) => setScale({ speed: Number(event.target.value) })}
                 />
                 <span className="mono field-value">{fmtNumber(state.speed, 2)}</span>
               </label>
@@ -855,9 +1122,7 @@ function ControlTab({ state, actions }) {
                     max="2"
                     step="0.05"
                     value={state.moveGain}
-                    onChange={(event) => {
-                      actions.setState((prev) => ({ ...prev, moveGain: Number(event.target.value) }));
-                    }}
+                    onChange={(event) => setScale({ moveGain: Number(event.target.value) })}
                   />
                   <span className="mono field-value">{fmtNumber(state.moveGain, 2)}</span>
                 </label>
@@ -870,9 +1135,7 @@ function ControlTab({ state, actions }) {
                     max="2"
                     step="0.05"
                     value={state.turnGain}
-                    onChange={(event) => {
-                      actions.setState((prev) => ({ ...prev, turnGain: Number(event.target.value) }));
-                    }}
+                    onChange={(event) => setScale({ turnGain: Number(event.target.value) })}
                   />
                   <span className="mono field-value">{fmtNumber(state.turnGain, 2)}</span>
                 </label>
@@ -893,11 +1156,14 @@ function ControlTab({ state, actions }) {
               <div className="cmd-v mono">{fmtNumber(driveMode === "sport" ? shown.w : shown.rx, 2)}</div>
             </div>
           </div>
+          </div>
+          </div>
         </Card>
       </div>
       <div className="board-logs">
         <ActionLogPanel state={state} />
         <JoystickLogPanel entries={joyEvents} pads={joyPads.length} />
+        <OdomBox />
       </div>
     </div>
   );

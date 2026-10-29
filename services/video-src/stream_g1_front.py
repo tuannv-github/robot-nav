@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Publish the Logitech BRIO to MediaMTX path /stream/g1/front.
+"""Publish the G1 front camera to MediaMTX path /stream/g1/front.
 
-Selects USB 046d:085e (Bus 002 Device 007 when that address is present)
-and publishes H.264 with WebRTC (WHIP). That skips the RTMP buffer.
-Viewers use the same path:
+Supports either:
+  - Logitech BRIO USB 046d:085e (Bus 002 Device 007 preferred)
+  - Razer Kiyo V2 USB 1532:0e0b (Bus 001 Device 007 preferred)
+
+Publishes H.264 with WebRTC (WHIP). Viewers use:
 
     rtsp://10.1.101.173:8554/stream/g1/front
 """
@@ -18,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 import urllib.error
 import urllib.request
@@ -29,30 +32,81 @@ gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC
 
-USB_VENDOR = "046d"
-USB_PRODUCT = "085e"
-USB_BUS = 2
-USB_DEVNUM = 7
 DEFAULT_HOST = "10.1.101.173"
 DEFAULT_PATH = "/stream/g1/front"
 DEFAULT_WEBRTC_PORT = 8889
-WIDTH = 1280
-HEIGHT = 720
+# Kiyo V2 / BRIO: 1080p MJPEG @ 30 with a higher H.264 bitrate for clearer WebRTC.
+WIDTH = 1920
+HEIGHT = 1080
 FPS = 30
+BITRATE = 6_000_000
+VBV_SIZE = 750_000
 RECONNECT_DELAY_S = 2
-# BRIO focus: 0 is far, 255 is near. A sweep of this hallway peaks at 0.
-# The 31 ms auto shutter smears the picture while the robot moves, so the
-# shutter is held at 10 ms and gain makes up the brightness.
+
 FOCUS_AUTO = 0x009A090C
 FOCUS_ABSOLUTE = 0x009A090A
-FOCUS_LOCKED = 0
+ZOOM_ABSOLUTE = 0x009A090D
 EXPOSURE_AUTO = 0x009A0901
 EXPOSURE_ABSOLUTE = 0x009A0902
 EXPOSURE_DYNAMIC = 0x009A0903
 GAIN = 0x00980913
+WHITE_BALANCE_AUTO = 0x0098090C
+WHITE_BALANCE_TEMPERATURE = 0x0098091A
+SATURATION = 0x00980902
 EXPOSURE_MANUAL = 1
-EXPOSURE_LOCKED = 100
-GAIN_LOCKED = 32
+# UVC zoom: 100 = 1× / widest FOV; higher values crop in.
+ZOOM_WIDEST = 100
+
+
+@dataclass(frozen=True)
+class CameraProfile:
+    name: str
+    vendor: str
+    product: str
+    bus: int
+    devnum: int
+    # Absolute focus: BRIO 0–255 (far=0), Kiyo 0–450 (hallway peak ~175).
+    focus: int
+    exposure: int
+    gain: int
+    zoom: int = ZOOM_WIDEST
+    focus_auto: int = 0
+    # wb_auto 1 = camera AWB; 0 = lock wb_temp (Kelvin; on Kiyo lower = cooler).
+    wb_auto: int = 1
+    wb_temp: int = 5000
+    saturation: int = 128
+
+
+# Prefer BRIO when both are plugged in; otherwise use whichever is present.
+CAMERAS = (
+    CameraProfile(
+        name="Logitech BRIO",
+        vendor="046d",
+        product="085e",
+        bus=2,
+        devnum=7,
+        focus=0,
+        exposure=100,
+        gain=32,
+        zoom=ZOOM_WIDEST,
+    ),
+    CameraProfile(
+        name="Razer Kiyo V2",
+        vendor="1532",
+        product="0e0b",
+        bus=1,
+        devnum=7,
+        focus=175,
+        exposure=100,
+        gain=32,
+        zoom=ZOOM_WIDEST,
+        # Keep AWB — manual Kelvin removes yellow but pushes a strong green cast
+        # under these lab fluorescents.
+        wb_auto=1,
+        wb_temp=5000,
+        saturation=128,
+    ),
+)
 
 
 def _sysfs_text(path: str) -> str:
@@ -63,7 +117,7 @@ def _sysfs_text(path: str) -> str:
         return ""
 
 
-def _brio_usb_devices() -> list[tuple[str, int, int]]:
+def _usb_devices(vendor: str, product: str) -> list[tuple[str, int, int]]:
     found: list[tuple[str, int, int]] = []
     root = "/sys/bus/usb/devices"
     try:
@@ -74,9 +128,9 @@ def _brio_usb_devices() -> list[tuple[str, int, int]]:
         device = os.path.join(root, name)
         if not os.path.isdir(device):
             continue
-        vendor = _sysfs_text(os.path.join(device, "idVendor")).lower()
-        product = _sysfs_text(os.path.join(device, "idProduct")).lower()
-        if vendor != USB_VENDOR or product != USB_PRODUCT:
+        if _sysfs_text(os.path.join(device, "idVendor")).lower() != vendor:
+            continue
+        if _sysfs_text(os.path.join(device, "idProduct")).lower() != product:
             continue
         bus = _sysfs_text(os.path.join(device, "busnum"))
         devnum = _sysfs_text(os.path.join(device, "devnum"))
@@ -100,46 +154,100 @@ def _capture_node(usb_device: str) -> str | None:
     return None
 
 
-def find_brio() -> tuple[str, int, int]:
-    matches = _brio_usb_devices()
-    if not matches:
-        raise RuntimeError(
-            f"Logitech BRIO {USB_VENDOR}:{USB_PRODUCT} is not connected"
+def find_front_camera() -> tuple[str, int, int, CameraProfile]:
+    for profile in CAMERAS:
+        matches = _usb_devices(profile.vendor, profile.product)
+        if not matches:
+            continue
+        chosen = next(
+            (item for item in matches if item[1] == profile.bus and item[2] == profile.devnum),
+            matches[0],
         )
-    chosen = next(
-        (item for item in matches if item[1] == USB_BUS and item[2] == USB_DEVNUM),
-        matches[0],
-    )
-    usb_path, bus, devnum = chosen
-    device = _capture_node(usb_path)
-    if device is None:
-        raise RuntimeError(
-            f"BRIO at bus {bus} device {devnum} has no V4L capture node"
-        )
-    return device, bus, devnum
+        usb_path, bus, devnum = chosen
+        device = _capture_node(usb_path)
+        if device is None:
+            continue
+        return device, bus, devnum, profile
+    names = ", ".join(f"{c.name} ({c.vendor}:{c.product})" for c in CAMERAS)
+    raise RuntimeError(f"no front camera connected; tried {names}")
 
 
 class _V4l2Control(ctypes.Structure):
     _fields_ = [("id", ctypes.c_uint32), ("value", ctypes.c_int32)]
 
 
-def lock_focus(device: str, focus: int = FOCUS_LOCKED) -> None:
-    """Hold far focus and a short shutter so motion does not smear the frame."""
+def lock_camera(device: str, profile: CameraProfile) -> None:
+    """Apply focus/zoom/exposure/WB from the profile (DB overlays included)."""
     request = (3 << 30) | (ctypes.sizeof(_V4l2Control) << 16) | (ord("V") << 8) | 28
-    controls = (
-        (FOCUS_AUTO, 0),
-        (FOCUS_ABSOLUTE, focus),
+    controls = [
+        (FOCUS_AUTO, profile.focus_auto),
+        (ZOOM_ABSOLUTE, profile.zoom),
         (EXPOSURE_AUTO, EXPOSURE_MANUAL),
-        (EXPOSURE_ABSOLUTE, EXPOSURE_LOCKED),
+        (EXPOSURE_ABSOLUTE, profile.exposure),
         (EXPOSURE_DYNAMIC, 0),
-        (GAIN, GAIN_LOCKED),
-    )
+        (GAIN, profile.gain),
+        (SATURATION, profile.saturation),
+        (WHITE_BALANCE_AUTO, profile.wb_auto),
+    ]
+    if profile.focus_auto == 0:
+        controls.insert(1, (FOCUS_ABSOLUTE, profile.focus))
+    # Temperature is only writable while AWB is off.
+    if profile.wb_auto == 0:
+        controls.append((WHITE_BALANCE_TEMPERATURE, profile.wb_temp))
     fd = os.open(device, os.O_RDWR)
     try:
         for control, value in controls:
             fcntl.ioctl(fd, request, _V4l2Control(control, value))
     finally:
         os.close(fd)
+
+
+def profile_with_saved(base: CameraProfile, topic: str) -> CameraProfile:
+    """Overlay persisted console settings from the G1 config database."""
+    try:
+        from camera_ctrl import load_settings, normalize_path
+    except ImportError:
+        return base
+    saved = load_settings(normalize_path(topic))
+    if not saved:
+        return base
+    return CameraProfile(
+        name=base.name,
+        vendor=base.vendor,
+        product=base.product,
+        bus=base.bus,
+        devnum=base.devnum,
+        focus=int(saved.get("focus", base.focus)),
+        exposure=int(saved.get("exposure", base.exposure)),
+        gain=int(saved.get("gain", base.gain)),
+        zoom=int(saved.get("zoom", base.zoom)),
+        focus_auto=int(saved.get("focus_auto", base.focus_auto)),
+        wb_auto=base.wb_auto,
+        wb_temp=base.wb_temp,
+        saturation=base.saturation,
+    )
+
+
+# Kept for callers that still import the old name.
+def lock_focus(device: str, focus: int | None = None) -> None:
+    profile = CAMERAS[0]
+    if focus is not None:
+        profile = CameraProfile(
+            name=profile.name,
+            vendor=profile.vendor,
+            product=profile.product,
+            bus=profile.bus,
+            devnum=profile.devnum,
+            focus=focus,
+            exposure=profile.exposure,
+            gain=profile.gain,
+            zoom=profile.zoom,
+            focus_auto=0,
+            wb_auto=profile.wb_auto,
+            wb_temp=profile.wb_temp,
+            saturation=profile.saturation,
+        )
+    lock_camera(device, profile)
 
 
 def whip_url(host: str, webrtc_port: int, path: str) -> str:
@@ -157,9 +265,9 @@ def build_pipeline(device: str) -> str:
             "shaded-background=true font-desc=\"Sans, 28\"",
             "! nvvidconv",
             "! video/x-raw(memory:NVMM),format=NV12",
-            "! nvv4l2h264enc bitrate=2000000 control-rate=1 preset-level=1",
-            "maxperf-enable=true iframeinterval=15 idrinterval=15",
-            "insert-sps-pps=true num-B-Frames=0 vbv-size=200000",
+            f"! nvv4l2h264enc bitrate={BITRATE} control-rate=1 preset-level=1",
+            "maxperf-enable=true iframeinterval=30 idrinterval=30",
+            f"insert-sps-pps=true num-B-Frames=0 vbv-size={VBV_SIZE}",
             "! h264parse config-interval=-1",
             "! rtph264pay name=pay pt=96 config-interval=-1 aggregate-mode=zero-latency",
         ]
@@ -282,10 +390,11 @@ class WhipSession:
 
 
 class Publisher:
-    def __init__(self, pipeline: str, whip: str, device: str) -> None:
+    def __init__(self, pipeline: str, whip: str, device: str, tune=None) -> None:
         self.pipeline_text = pipeline
         self.whip = whip
         self.device = device
+        self.tune = tune
         self.loop = GLib.MainLoop()
         self.pipeline: Gst.Pipeline | None = None
         self.session: WhipSession | None = None
@@ -293,12 +402,12 @@ class Publisher:
         self.failed = False
 
     def _lock_focus(self) -> bool:
+        if self.tune is None:
+            return False
         try:
-            lock_focus(self.device)
+            self.tune()
         except OSError as exc:
-            print(f"could not lock focus: {exc}", file=sys.stderr)
-        else:
-            print(f"focus locked at {FOCUS_LOCKED}, shutter {EXPOSURE_LOCKED // 10}ms")
+            print(f"could not tune camera: {exc}", file=sys.stderr)
         return False
 
     def _attach_timestamp(self) -> None:
@@ -373,7 +482,7 @@ class Publisher:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream the Logitech BRIO to MediaMTX /stream/g1/front.",
+        description="Stream the G1 front camera (BRIO or Kiyo V2) to MediaMTX /stream/g1/front.",
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="MediaMTX host")
     parser.add_argument("--webrtc-port", type=int, default=DEFAULT_WEBRTC_PORT)
@@ -381,7 +490,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         default="",
-        help="V4L device. Default: BRIO capture node for 046d:085e",
+        help="V4L device. Default: auto-detect BRIO or Kiyo V2",
     )
     return parser.parse_args()
 
@@ -390,18 +499,43 @@ def main() -> int:
     Gst.init(None)
     args = parse_args()
     if args.device:
-        device, bus, devnum = args.device, USB_BUS, USB_DEVNUM
+        device, bus, devnum, profile = args.device, 0, 0, CAMERAS[0]
+        for candidate in CAMERAS:
+            matches = _usb_devices(candidate.vendor, candidate.product)
+            if matches:
+                profile = candidate
+                bus, devnum = matches[0][1], matches[0][2]
+                break
     else:
-        device, bus, devnum = find_brio()
+        device, bus, devnum, profile = find_front_camera()
     location = whip_url(args.host, args.webrtc_port, args.path)
     print(
-        f"BRIO bus {bus} device {devnum} ({USB_VENDOR}:{USB_PRODUCT}) {device} "
+        f"{profile.name} bus {bus} device {devnum} "
+        f"({profile.vendor}:{profile.product}) {device} "
         f"{WIDTH}x{HEIGHT}@{FPS}"
     )
     print(f"publish {location}")
     print(f"watch rtsp://{args.host}:8554/{args.path.strip('/')}")
 
-    publisher = Publisher(build_pipeline(device), location, device)
+    def _tune() -> None:
+        active = profile_with_saved(profile, args.path)
+        lock_camera(device, active)
+        wb = (
+            f"wb {active.wb_temp}K"
+            if active.wb_auto == 0
+            else "wb auto"
+        )
+        focus_txt = (
+            "autofocus"
+            if active.focus_auto
+            else f"focus {active.focus}"
+        )
+        print(
+            f"{focus_txt}, zoom {active.zoom}, {wb}, "
+            f"shutter {active.exposure // 10}ms ({active.name})"
+        )
+
+    publisher = Publisher(build_pipeline(device), location, device, tune=_tune)
 
     def _stop(_signum: int, _frame: object) -> None:
         publisher.stop()

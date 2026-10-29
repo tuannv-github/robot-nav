@@ -19,6 +19,7 @@ BRIDGE="${PROJECT_DIR}/src/g1_controller/scripts/g1_controller_bridge.py"
 CONSOLE_DIR="${PROJECT_DIR}/src/g1_controller/console/web"
 SDK_DIR="${G1_SDK_DIR:-${PROJECT_DIR}/../3thrdparties/unitree_sdk2_python}"
 VIDEO_SRC="${PROJECT_DIR}/services/video-src/stream_g1_front.py"
+VIDEO_DOWN="${PROJECT_DIR}/services/video-src/stream_g1_down.py"
 export G1_MEDIAMTX_HOST="${G1_MEDIAMTX_HOST:-10.1.101.173}"
 
 export G1_CONSOLE_DIR="${CONSOLE_DIR}"
@@ -80,7 +81,7 @@ stop_existing_controller() {
   local pid killed=0
   local -a pids=()
 
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py" || true)
+  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     if kill -0 "${pid}" 2>/dev/null; then
@@ -99,7 +100,7 @@ stop_existing_controller() {
   local i
   for i in $(seq 1 25); do
     local still=0
-    mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py" || true)
+    mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py" || true)
     for pid in "${pids[@]}"; do
       [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
       if kill -0 "${pid}" 2>/dev/null; then
@@ -113,7 +114,7 @@ stop_existing_controller() {
   done
 
   echo "Existing G1 controller did not exit; sending SIGKILL..."
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py" || true)
+  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     kill -9 "${pid}" 2>/dev/null || true
@@ -124,8 +125,12 @@ stop_existing_controller() {
 stop_existing_controller
 
 if [[ -f "${VIDEO_SRC}" ]]; then
-  echo "Starting BRIO stream -> whip://${G1_MEDIAMTX_HOST}:8889/stream/g1/front"
+  echo "Starting front camera stream -> whip://${G1_MEDIAMTX_HOST}:8889/stream/g1/front"
   nohup /usr/bin/python3 "${VIDEO_SRC}" --host "${G1_MEDIAMTX_HOST}" >/tmp/g1-video-src.log 2>&1 &
+fi
+if [[ -f "${VIDEO_DOWN}" ]]; then
+  echo "Starting RealSense stream -> whip://${G1_MEDIAMTX_HOST}:8889/stream/g1/down"
+  nohup /usr/bin/python3 "${VIDEO_DOWN}" --host "${G1_MEDIAMTX_HOST}" >/tmp/g1-video-src-down.log 2>&1 &
 fi
 
 if [[ -f "${PROJECT_DIR}/install/setup.bash" ]] && command -v ros2 >/dev/null 2>&1; then

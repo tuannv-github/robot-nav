@@ -1,6 +1,6 @@
-// tabs/VideoTab.jsx — subscribe to a MediaMTX topic over WebRTC (lowest latency).
+// tabs/VideoTab.jsx — subscribe to a MediaMTX topic over WebRTC; tune camera by topic.
 
-const { useEffect, useRef, useState } = React;
+const { useEffect, useRef, useState, useCallback } = React;
 
 const PREFERRED_TOPIC = "stream/g1/front";
 
@@ -61,13 +61,48 @@ async function subscribeWhep(topic, video) {
   return pc;
 }
 
+function ctrlMeta(camera, name) {
+  return camera && camera.controls && camera.controls[name] ? camera.controls[name] : null;
+}
+
 function VideoTab() {
   const videoRef = useRef(null);
   const pcRef = useRef(null);
+  const putTimer = useRef(null);
   const [topics, setTopics] = useState([]);
   const [topic, setTopic] = useState("");
   const [status, setStatus] = useState("idle");
   const [error, setError] = useState("");
+  const [camera, setCamera] = useState(null);
+  const [draft, setDraft] = useState({ zoom: null, focus: null, focus_auto: 0 });
+  const [busy, setBusy] = useState(false);
+
+  const loadCamera = useCallback(async (path, { silent } = {}) => {
+    if (!path) {
+      setCamera(null);
+      return;
+    }
+    try {
+      const response = await fetch("/video/camera?path=" + encodeURIComponent(path));
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) {
+        if (!silent) setError(payload.error || "camera status failed");
+        setCamera(payload.controllable ? payload : { ...payload, controllable: false });
+        return;
+      }
+      setCamera(payload);
+      if (payload.controllable) {
+        setDraft({
+          zoom: payload.controls?.zoom?.value ?? null,
+          focus: payload.controls?.focus?.value ?? null,
+          focus_auto: payload.controls?.focus_auto?.value ?? 0,
+        });
+      }
+    } catch (exc) {
+      if (!silent) setError(String(exc.message || exc));
+      setCamera(null);
+    }
+  }, []);
 
   useEffect(() => {
     let stopped = false;
@@ -79,7 +114,7 @@ function VideoTab() {
         if (stopped) return;
         const next = Array.isArray(payload.topics) ? payload.topics : [];
         setTopics(next);
-        setError(payload.ok ? "" : (payload.error || "Could not list topics"));
+        if (!payload.ok) setError(payload.error || "Could not list topics");
         setTopic((current) => {
           if (current && next.some((item) => item.name === current)) return current;
           if (next.some((item) => item.name === PREFERRED_TOPIC)) return PREFERRED_TOPIC;
@@ -98,6 +133,22 @@ function VideoTab() {
       clearInterval(timer);
     };
   }, []);
+
+  useEffect(() => {
+    if (!topic) {
+      setCamera(null);
+      return undefined;
+    }
+    let stopped = false;
+    loadCamera(topic);
+    const timer = setInterval(() => {
+      if (!stopped) loadCamera(topic, { silent: true });
+    }, 3000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [topic, loadCamera]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -147,6 +198,48 @@ function VideoTab() {
     };
   }, [topic]);
 
+  useEffect(() => () => {
+    if (putTimer.current) clearTimeout(putTimer.current);
+  }, []);
+
+  const applyControls = useCallback(async (path, body) => {
+    setBusy(true);
+    try {
+      const response = await fetch("/video/camera?path=" + encodeURIComponent(path), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) {
+        setError(payload.error || "camera update failed");
+        return;
+      }
+      setError("");
+      setCamera(payload);
+      setDraft({
+        zoom: payload.controls?.zoom?.value ?? null,
+        focus: payload.controls?.focus?.value ?? null,
+        focus_auto: payload.controls?.focus_auto?.value ?? 0,
+      });
+    } catch (exc) {
+      setError(String(exc.message || exc));
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const schedulePut = useCallback((body) => {
+    if (!topic) return;
+    if (putTimer.current) clearTimeout(putTimer.current);
+    putTimer.current = setTimeout(() => applyControls(topic, body), 120);
+  }, [topic, applyControls]);
+
+  const zoom = ctrlMeta(camera, "zoom");
+  const focus = ctrlMeta(camera, "focus");
+  const focusAuto = ctrlMeta(camera, "focus_auto");
+  const controllable = !!(camera && camera.controllable);
+
   return (
     <div className="video-page">
       <div className="video-toolbar">
@@ -161,13 +254,98 @@ function VideoTab() {
             <option value="">{topics.length ? "Select a topic" : "No topics"}</option>
             {topics.map((item) => (
               <option key={item.name} value={item.name}>
-                {(item.ready ? "" : "offline · ") + item.name}
+                {(item.ready ? "" : "offline · ")
+                  + item.name
+                  + (item.controllable ? " · cam" : "")}
               </option>
             ))}
           </select>
         </label>
         <span className={"video-status video-status-" + status}>{status}</span>
       </div>
+
+      {controllable ? (
+        <div className="video-controls">
+          <div className="video-cam-meta">
+            <span>{camera.camera || "Camera"}</span>
+            <span className="video-cam-device">{camera.device}</span>
+          </div>
+          {zoom ? (
+            <label className="video-ctrl">
+              <span className="field-label">
+                Zoom <strong>{draft.zoom ?? zoom.value}</strong>
+                <span className="video-ctrl-hint"> (lower = wider)</span>
+              </span>
+              <input
+                className="stick-range"
+                type="range"
+                min={zoom.min}
+                max={zoom.max}
+                step={zoom.step || 1}
+                value={draft.zoom ?? zoom.value}
+                disabled={busy}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setDraft((prev) => ({ ...prev, zoom: value }));
+                  schedulePut({ zoom: value });
+                }}
+              />
+              <div className="video-ctrl-actions">
+                <button
+                  type="button"
+                  className="icon-btn"
+                  disabled={busy || (draft.zoom ?? zoom.value) === zoom.min}
+                  onClick={() => {
+                    setDraft((prev) => ({ ...prev, zoom: zoom.min }));
+                    applyControls(topic, { zoom: zoom.min });
+                  }}
+                >
+                  Widest
+                </button>
+              </div>
+            </label>
+          ) : null}
+          {focus ? (
+            <label className="video-ctrl">
+              <span className="field-label">
+                Focus <strong>{draft.focus ?? focus.value}</strong>
+              </span>
+              <input
+                className="stick-range"
+                type="range"
+                min={focus.min}
+                max={focus.max}
+                step={focus.step || 1}
+                value={draft.focus ?? focus.value}
+                disabled={busy || !!(draft.focus_auto ?? focusAuto?.value)}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setDraft((prev) => ({ ...prev, focus: value, focus_auto: 0 }));
+                  schedulePut({ focus: value, focus_auto: 0 });
+                }}
+              />
+            </label>
+          ) : null}
+          {focusAuto ? (
+            <label className="video-check">
+              <input
+                type="checkbox"
+                checked={!!(draft.focus_auto ?? focusAuto.value)}
+                disabled={busy}
+                onChange={(event) => {
+                  const value = event.target.checked ? 1 : 0;
+                  setDraft((prev) => ({ ...prev, focus_auto: value }));
+                  applyControls(topic, { focus_auto: value });
+                }}
+              />
+              <span>Autofocus</span>
+            </label>
+          ) : null}
+        </div>
+      ) : topic ? (
+        <p className="video-cam-note">No camera controls for this topic.</p>
+      ) : null}
+
       <div className="video-stage">
         <video
           ref={videoRef}

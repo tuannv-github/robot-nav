@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import glob
 import json
+import math
 import os
 import re
 import sqlite3
+import struct
+import sys
 import threading
 import time
 from datetime import datetime
@@ -57,6 +61,142 @@ HTTP_CLIENT_SEC = 3.0
 HOLD_TIMEOUT_SEC = 0.45
 HOLD_PERIOD_SEC = 0.2
 VELOCITY_DURATION_SEC = 0.5
+ODOM_STALE_SEC = 1.0
+ODOM_SOURCES = (
+    {"id": "pelvis", "name": "Pelvis", "topic": "rt/state_estimator/odom_pelvis", "kind": "nav"},
+    {"id": "torso", "name": "Torso", "topic": "rt/state_estimator/odom_torso", "kind": "nav"},
+    {"id": "odom", "name": "Odom mode", "topic": "rt/odommodestate", "kind": "sport"},
+    {"id": "fusion", "name": "Fusion", "topic": "rt/state_estimator/fusion_odom", "kind": "nav"},
+    {"id": "fusion-torso", "name": "Fusion torso", "topic": "rt/state_estimator/fusion_odom_torso", "kind": "nav"},
+)
+
+
+def _vec3(x, y, z) -> list[float]:
+    return [float(x), float(y), float(z)]
+
+
+def _rpy_from_quat(x: float, y: float, z: float, w: float) -> list[float]:
+    sin_roll = 2.0 * (w * x + y * z)
+    cos_roll = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sin_roll, cos_roll)
+    sin_pitch = 2.0 * (w * y - z * x)
+    if abs(sin_pitch) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sin_pitch)
+    else:
+        pitch = math.asin(sin_pitch)
+    sin_yaw = 2.0 * (w * z + x * y)
+    cos_yaw = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(sin_yaw, cos_yaw)
+    return [roll, pitch, yaw]
+
+
+class OdomFeed:
+    """Latest sample from each G1 odometry topic. Read-only DDS subscribers."""
+
+    def __init__(self):
+        self.error = ""
+        self._lock = threading.Lock()
+        self._slots = {
+            spec["id"]: {
+                "sample": None,
+                "mono": 0.0,
+                "count": 0,
+                "hz": 0.0,
+                "hz_stamp": time.monotonic(),
+                "hz_count": 0,
+            }
+            for spec in ODOM_SOURCES
+        }
+        self._subs = []
+
+    def start(self) -> None:
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
+        from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_
+
+        for spec in ODOM_SOURCES:
+            msg_type = Odometry_ if spec["kind"] == "nav" else SportModeState_
+            sub = ChannelSubscriber(spec["topic"], msg_type)
+
+            def on_sample(msg, source_id=spec["id"], kind=spec["kind"]):
+                self._store(source_id, kind, msg)
+
+            sub.Init(on_sample, 1)
+            self._subs.append(sub)
+
+    def _store(self, source_id: str, kind: str, msg) -> None:
+        try:
+            sample = self._parse(kind, msg)
+        except Exception:
+            return
+        now = time.monotonic()
+        with self._lock:
+            slot = self._slots.get(source_id)
+            if slot is None:
+                return
+            slot["sample"] = sample
+            slot["mono"] = now
+            slot["count"] += 1
+            window = now - slot["hz_stamp"]
+            if window >= 1.0:
+                slot["hz"] = (slot["count"] - slot["hz_count"]) / window
+                slot["hz_stamp"] = now
+                slot["hz_count"] = slot["count"]
+
+    def _parse(self, kind: str, msg) -> dict:
+        if kind == "nav":
+            position = msg.pose.pose.position
+            quat = msg.pose.pose.orientation
+            linear = msg.twist.twist.linear
+            angular = msg.twist.twist.angular
+            return {
+                "frame_id": str(msg.header.frame_id or ""),
+                "child_frame_id": str(msg.child_frame_id or ""),
+                "position": _vec3(position.x, position.y, position.z),
+                "rpy": _rpy_from_quat(quat.x, quat.y, quat.z, quat.w),
+                "linear": _vec3(linear.x, linear.y, linear.z),
+                "angular": _vec3(angular.x, angular.y, angular.z),
+            }
+        rpy = msg.imu_state.rpy
+        return {
+            "frame_id": "",
+            "child_frame_id": "",
+            "position": _vec3(msg.position[0], msg.position[1], msg.position[2]),
+            "rpy": _vec3(rpy[0], rpy[1], rpy[2]),
+            "linear": _vec3(msg.velocity[0], msg.velocity[1], msg.velocity[2]),
+            "angular": _vec3(0.0, 0.0, msg.yaw_speed),
+        }
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        sources = []
+        with self._lock:
+            for spec in ODOM_SOURCES:
+                slot = self._slots[spec["id"]]
+                age = None
+                live = False
+                if slot["mono"]:
+                    age = max(0.0, now - slot["mono"])
+                    live = age <= ODOM_STALE_SEC
+                row = {
+                    "id": spec["id"],
+                    "name": spec["name"],
+                    "topic": spec["topic"],
+                    "live": live,
+                    "hz": round(float(slot["hz"]), 1),
+                    "age_ms": None if age is None else int(age * 1000),
+                    "frame_id": "",
+                    "child_frame_id": "",
+                    "position": None,
+                    "rpy": None,
+                    "linear": None,
+                    "angular": None,
+                }
+                if slot["sample"]:
+                    row.update(slot["sample"])
+                    row["live"] = live
+                sources.append(row)
+        return {"ok": True, "sources": sources, "error": self.error}
 
 
 def _config_db_path() -> str:
@@ -395,6 +535,205 @@ class InterfaceStore:
         return cfg
 
 
+SCALE_LIMITS = {
+    "move": (0.0, 2.0),
+    "turn": (0.0, 2.0),
+    "speed": (0.0, 0.6),
+}
+SCALE_DEFAULTS = {"move": 0.35, "turn": 1.0, "speed": 0.2}
+
+
+def _scale_value(raw, name: str) -> float:
+    low, high = SCALE_LIMITS[name]
+    try:
+        number = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be finite")
+    if number < low or number > high:
+        raise ValueError(f"{name} must be from {low:g} to {high:g}")
+    return number
+
+
+class ScaleStore:
+    """Move, turn, and sport speed scales, kept in the controller database."""
+
+    def __init__(self, path: str):
+        self.path = path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._lock = threading.Lock()
+        with self._connect() as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scale (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    move REAL NOT NULL,
+                    turn REAL NOT NULL,
+                    speed REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=5)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def load(self) -> dict:
+        with self._lock:
+            with self._connect() as db:
+                row = db.execute("SELECT move, turn, speed FROM scale WHERE id = 1").fetchone()
+                if row is None:
+                    self._write(db, SCALE_DEFAULTS)
+                    return dict(SCALE_DEFAULTS)
+                return {
+                    "move": float(row["move"]),
+                    "turn": float(row["turn"]),
+                    "speed": float(row["speed"]),
+                }
+
+    def save(self, incoming: dict) -> dict:
+        if not isinstance(incoming, dict):
+            raise ValueError("scale must be an object")
+        saved = {
+            "move": _scale_value(incoming.get("move", SCALE_DEFAULTS["move"]), "move"),
+            "turn": _scale_value(incoming.get("turn", SCALE_DEFAULTS["turn"]), "turn"),
+            "speed": _scale_value(incoming.get("speed", SCALE_DEFAULTS["speed"]), "speed"),
+        }
+        with self._lock:
+            with self._connect() as db:
+                self._write(db, saved)
+        return saved
+
+    def _write(self, db: sqlite3.Connection, cfg: dict) -> None:
+        db.execute(
+            """
+            INSERT INTO scale (id, move, turn, speed, updated_at)
+            VALUES (1, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                move = excluded.move,
+                turn = excluded.turn,
+                speed = excluded.speed,
+                updated_at = excluded.updated_at
+            """,
+            (cfg["move"], cfg["turn"], cfg["speed"], time.time()),
+        )
+        db.commit()
+
+
+class CameraStore:
+    """Per-topic camera controls in the same SQLite DB as interfaces/scale."""
+
+    def __init__(self, path: str):
+        self.path = path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._lock = threading.Lock()
+        with self._connect() as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS camera (
+                    path TEXT PRIMARY KEY,
+                    settings TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            db.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=5)
+        db.row_factory = sqlite3.Row
+        return db
+
+    @staticmethod
+    def _sanitize(settings: dict) -> dict:
+        keys = ("zoom", "focus", "focus_auto", "exposure", "gain", "exposure_auto")
+        clean = {}
+        for key in keys:
+            if key not in settings or settings[key] is None:
+                continue
+            try:
+                clean[key] = int(settings[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{key} must be an integer") from exc
+        return clean
+
+    def load(self, topic: str) -> dict:
+        name = str(topic or "").strip().strip("/")
+        with self._lock:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT settings FROM camera WHERE path = ?",
+                    (name,),
+                ).fetchone()
+        if row is None:
+            return {}
+        try:
+            payload = json.loads(row["settings"])
+        except (TypeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return self._sanitize(payload)
+
+    def load_all(self) -> dict:
+        with self._lock:
+            with self._connect() as db:
+                rows = db.execute("SELECT path, settings FROM camera").fetchall()
+        out = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["settings"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                out[str(row["path"])] = self._sanitize(payload)
+        return out
+
+    def merge(self, topic: str, updates: dict) -> dict:
+        name = str(topic or "").strip().strip("/")
+        if not name:
+            raise ValueError("camera topic is required")
+        if not isinstance(updates, dict):
+            raise ValueError("camera settings must be an object")
+        patch = self._sanitize(updates)
+        if not patch:
+            raise ValueError("no camera settings to save")
+        with self._lock:
+            current = {}
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT settings FROM camera WHERE path = ?",
+                    (name,),
+                ).fetchone()
+                if row is not None:
+                    try:
+                        payload = json.loads(row["settings"])
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    if isinstance(payload, dict):
+                        current = self._sanitize(payload)
+                current.update(patch)
+                db.execute(
+                    """
+                    INSERT INTO camera (path, settings, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        settings = excluded.settings,
+                        updated_at = excluded.updated_at
+                    """,
+                    (name, json.dumps(current, sort_keys=True), time.time()),
+                )
+                db.commit()
+        return current
+
+
 class ZmqInterface:
     """PULL socket. Clients PUSH the same JSON control messages used on the WebSocket."""
 
@@ -574,12 +913,194 @@ class ZmqInterface:
         self.running = False
 
 
+JS_EVENT_FMT = "<IhBB"
+JS_EVENT_SIZE = struct.calcsize(JS_EVENT_FMT)
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+
+
+class LocalJoystick:
+    """Read /dev/input/js* on this machine and feed the same stick hold as POST /wireless.
+
+    The browser Gamepad API is silent when the tab is not focused. A local device
+    is not.
+    """
+
+    def __init__(self, robot: "G1Controller"):
+        self.robot = robot
+        self.path = ""
+        self.error = ""
+        self._grab = False
+        self._fd = -1
+        self._kind = "js"
+        self._axes = [0.0] * 8
+        self._axis_n = 0
+        self._scale = {"move": 0.35, "turn": 1.0}
+        self._scale_ts = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="g1-js", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self.set_grab(False)
+        self._close()
+
+    def set_grab(self, grab: bool) -> None:
+        with self._lock:
+            was = self._grab
+            self._grab = bool(grab)
+        if was and not grab:
+            self.robot.stop_motion(source="js")
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "grab": self._grab,
+                "path": self.path or "",
+                "error": self.error,
+            }
+
+    def _close(self) -> None:
+        fd = self._fd
+        self._fd = -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _open(self) -> bool:
+        if self._fd >= 0:
+            return True
+        paths = sorted(glob.glob("/dev/input/js*")) + self._event_paths()
+        if not paths:
+            self.error = "No local joystick (plug it into this computer)"
+            self.path = ""
+            return False
+        last = "open failed"
+        for path in paths:
+            try:
+                self._fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as exc:
+                last = str(exc)
+                continue
+            self.path = path
+            self._kind = "evdev" if "event" in os.path.basename(path) else "js"
+            self.error = ""
+            self._axes = [0.0] * 8
+            self._axis_n = 0
+            return True
+        self.error = last
+        self.path = ""
+        return False
+
+    def _event_paths(self) -> list:
+        paths = []
+        try:
+            text = open("/proc/bus/input/devices", encoding="utf-8", errors="replace").read()
+        except OSError:
+            return paths
+        block = {}
+        for line in text.splitlines() + [""]:
+            if not line.strip():
+                name = (block.get("N") or "").lower()
+                handlers = block.get("H") or ""
+                bits = block.get("ABS") or ""
+                if bits and any(word in name for word in ("js", "joy", "gamepad", "xbox", "sony", "wireless controller", "8bitdo")):
+                    for part in handlers.split():
+                        if part.startswith("event"):
+                            paths.append("/dev/input/" + part)
+                block = {}
+                continue
+            if line[1:2] == ":":
+                block[line[0]] = line[3:].strip()
+            elif line.startswith("B: ABS="):
+                block["ABS"] = line.split("=", 1)[-1]
+        return paths
+
+    def _axis(self, index: int) -> float:
+        if index >= len(self._axes):
+            return 0.0
+        return self._axes[index]
+
+    def _read(self) -> None:
+        if self._fd < 0:
+            return
+        size = 24 if self._kind == "evdev" else JS_EVENT_SIZE
+        while True:
+            try:
+                raw = os.read(self._fd, size)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                self.error = str(exc)
+                self._close()
+                return
+            if len(raw) != size:
+                return
+            if self._kind == "evdev":
+                _sec, _usec, ev_type, code, value = struct.unpack("<QQHHi", raw)
+                if ev_type != 3 or code >= len(self._axes):
+                    continue
+                self._axes[code] = max(-1.0, min(1.0, value / 32767.0))
+                if code > self._axis_n:
+                    self._axis_n = code
+                continue
+            _ts, value, kind, number = struct.unpack(JS_EVENT_FMT, raw)
+            kind &= ~0x80
+            if kind == JS_EVENT_AXIS and number < len(self._axes):
+                self._axes[number] = max(-1.0, min(1.0, value / 32767.0))
+                if number > self._axis_n:
+                    self._axis_n = number
+
+    def _loop(self) -> None:
+        last_sig = None
+        while not self._stop.wait(0.02):
+            with self._lock:
+                grab = self._grab
+            if not grab:
+                last_sig = None
+                if self._fd >= 0:
+                    self._close()
+                continue
+            if not self._open():
+                continue
+            self._read()
+            lx = self._axis(0)
+            ly = -self._axis(1)
+            rx = self._axis(3) if self._axis_n >= 3 else self._axis(2)
+            now = time.time()
+            if now - self._scale_ts > 0.5:
+                self._scale = self.robot.scales.load()
+                self._scale_ts = now
+            move = float(self._scale.get("move") or 0.35)
+            turn = float(self._scale.get("turn") or 1.0)
+            out = (lx * move, ly * move, rx * turn)
+            active = max(abs(out[0]), abs(out[1]), abs(out[2])) > 0.0001
+            sig = tuple(round(v, 3) for v in out) if active else ("stop",)
+            if sig == last_sig and not active:
+                continue
+            last_sig = sig
+            if active:
+                self.robot.set_stick(out[0], out[1], out[2], source="js")
+            elif self.robot._hold.get("mode") == "stick":
+                self.robot.stop_motion(source="js")
+
+
 class G1Controller:
     def __init__(self, network_interface: str):
         self.network_interface = network_interface
         self.actions = ActionLog(_action_log_path())
-        self.interfaces = InterfaceStore(_config_db_path())
+        db_path = _config_db_path()
+        self.interfaces = InterfaceStore(db_path)
+        self.scales = ScaleStore(db_path)
+        self.cameras = CameraStore(db_path)
         self.http_clients = HttpClients()
+        self.local_js = LocalJoystick(self)
         self.zmq_iface = ZmqInterface(self)
         self.bind_host = ""
         self.bind_port = 0
@@ -590,6 +1111,7 @@ class G1Controller:
         self.client = None
         self.arm_client = None
         self.arm_actions = []
+        self.odom = OdomFeed()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._hold = {
@@ -631,6 +1153,10 @@ class G1Controller:
         self.arm_client.SetTimeout(10.0)
         self.arm_client.Init()
         self.arm_actions = self._load_arm_actions(action_map)
+        try:
+            self.odom.start()
+        except Exception as exc:
+            self.odom.error = str(exc)
         self.ready = True
         self.actions.record(
             "system",
@@ -639,6 +1165,7 @@ class G1Controller:
             source="bridge",
         )
         self._thread.start()
+        self.local_js.start()
 
     def _load_arm_actions(self, action_map: dict) -> list:
         actions = [
@@ -667,6 +1194,7 @@ class G1Controller:
 
     def shutdown(self) -> None:
         self._stop.set()
+        self.local_js.shutdown()
         self.zmq_iface.close()
         self.actions.record("system", "Controller stopping", source="bridge")
         self.stop_motion(record=False)
@@ -719,6 +1247,7 @@ class G1Controller:
             },
             "error": self.last_error,
             "links": self.link_status(),
+            "js": self.local_js.status(),
         }
 
     def link_status(self) -> dict:
@@ -1030,6 +1559,7 @@ def _openapi_spec() -> dict:
             "rx": {"type": "number"},
             "ry": {"type": "number"},
             "keys": {"type": "integer"},
+            "grab": {"type": "boolean"},
         },
     }
     vel = {
@@ -1040,6 +1570,20 @@ def _openapi_spec() -> dict:
             "w": {"type": "number", "description": "Yaw rad/s"},
         },
     }
+    camera_q = [
+        {
+            "name": "path",
+            "in": "query",
+            "required": True,
+            "schema": {"type": "string", "example": "stream/g1/front"},
+        }
+    ]
+
+    def op(tag, summary, **extra):
+        body = {"tags": [tag], "summary": summary, "responses": ok}
+        body.update(extra)
+        return body
+
     return {
         "openapi": "3.0.3",
         "info": {
@@ -1053,34 +1597,91 @@ def _openapi_spec() -> dict:
                 "on connect and whenever the command changes."
             ),
         },
+        "tags": [
+            {"name": "Status", "description": "Health, FSM, odometry, and the action log"},
+            {"name": "Drive", "description": "Stick, body velocity, and stop"},
+            {"name": "Modes", "description": "Sport actions and walking FSM"},
+            {"name": "Gestures", "description": "Arm gestures"},
+            {"name": "Video", "description": "MediaMTX streams and camera controls"},
+            {"name": "Config", "description": "Interfaces and stick scales"},
+        ],
         "paths": {
-            "/health": {"get": {"summary": "SDK and FSM status", "responses": ok}},
+            "/health": {"get": op("Status", "SDK and FSM status")},
+            "/fsm": {"get": op("Status", "Current FSM id")},
+            "/odom": {"get": op("Status", "Latest sample from each odometry topic")},
+            "/logs": {"get": op("Status", "Controlled-action log")},
             "/wireless": {
-                "post": {
-                    "summary": "Left stick moves, right stick turns",
-                    "requestBody": {"content": {"application/json": {"schema": stick}}},
-                    "responses": ok,
-                }
+                "post": op(
+                    "Drive",
+                    "Left stick moves, right stick turns",
+                    requestBody={"content": {"application/json": {"schema": stick}}},
+                )
             },
             "/cmd_vel": {
-                "post": {
-                    "summary": "Body velocity hold",
-                    "requestBody": {"content": {"application/json": {"schema": vel}}},
-                    "responses": ok,
-                }
+                "post": op(
+                    "Drive",
+                    "Body velocity hold",
+                    requestBody={"content": {"application/json": {"schema": vel}}},
+                )
             },
-            "/cmd_vel/stop": {"post": {"summary": "StopMove", "responses": ok}},
-            "/sport": {"get": {"summary": "Sport action catalog", "responses": ok}},
-            "/sport/{slug}": {
-                "post": {"summary": "Run a sport or FSM action", "responses": ok}
+            "/cmd_vel/stop": {"post": op("Drive", "StopMove")},
+            "/control": {
+                "get": op(
+                    "Drive",
+                    "WebSocket control stream",
+                    description="Upgrade to WebSocket. Send {type: stick|cmd_vel|stop}.",
+                )
             },
-            "/arm": {"get": {"summary": "Arm gesture catalog", "responses": ok}},
-            "/arm/{slug}": {"post": {"summary": "Run an arm gesture", "responses": ok}},
-            "/fsm": {"get": {"summary": "Current FSM id", "responses": ok}},
-            "/logs": {"get": {"summary": "Controlled-action log", "responses": ok}},
+            "/sport": {"get": op("Modes", "Sport action catalog")},
+            "/sport/{slug}": {"post": op("Modes", "Run a sport or FSM action")},
+            "/arm": {"get": op("Gestures", "Arm gesture catalog")},
+            "/arm/{slug}": {"post": op("Gestures", "Run an arm gesture")},
+            "/video/paths": {"get": op("Video", "List MediaMTX topics (streams)")},
+            "/video/whep": {
+                "post": op(
+                    "Video",
+                    "Proxy WebRTC WHEP offer for a topic",
+                    parameters=[
+                        {
+                            "name": "path",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "string"},
+                        }
+                    ],
+                )
+            },
+            "/video/camera": {
+                "get": op("Video", "Read V4L2 camera controls for a topic", parameters=camera_q),
+                "put": op(
+                    "Video",
+                    "Set V4L2 camera controls; saved in the same config.db as scale/interfaces",
+                    parameters=camera_q,
+                    requestBody={
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "zoom": {"type": "integer"},
+                                        "focus": {"type": "integer"},
+                                        "focus_auto": {"type": "integer"},
+                                        "exposure": {"type": "integer"},
+                                        "gain": {"type": "integer"},
+                                    },
+                                }
+                            }
+                        }
+                    },
+                ),
+            },
             "/config/interfaces": {
-                "get": {"summary": "HTTP, WebSocket, and ZMQ settings", "responses": ok},
-                "put": {"summary": "Save interface settings to the database", "responses": ok},
+                "get": op("Config", "HTTP, WebSocket, and ZMQ settings"),
+                "put": op("Config", "Save interface settings to the database"),
+            },
+            "/config/scale": {
+                "get": op("Config", "Move, turn, and speed scales"),
+                "put": op("Config", "Save move, turn, and speed scales"),
             },
         },
     }
@@ -1228,11 +1829,18 @@ def build_app(robot: G1Controller):
     async def health(_request: Request):
         return JSONResponse(robot.health())
 
+    async def odom_get(_request: Request):
+        return JSONResponse(robot.odom.snapshot())
+
     async def wireless(request: Request):
         try:
             body = await request.json()
         except Exception:
             return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+        if "grab" in body:
+            robot.local_js.set_grab(bool(body.get("grab")))
+            if not any(key in body for key in ("lx", "ly", "rx", "ry")):
+                return JSONResponse({"ok": True, "js": robot.local_js.status()})
         robot.set_stick(
             float(body.get("lx") or 0.0),
             float(body.get("ly") or 0.0),
@@ -1369,9 +1977,54 @@ def build_app(robot: G1Controller):
         restart = robot.apply_interface_config(saved)
         return JSONResponse(_interface_payload(restart))
 
+    async def scale_get(_request: Request):
+        return JSONResponse({"ok": True, **robot.scales.load()})
+
+    async def scale_put(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+        try:
+            saved = robot.scales.save(body if isinstance(body, dict) else {})
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, **saved})
+
     mediamtx_host = os.environ.get("G1_MEDIAMTX_HOST", "10.1.101.173")
     mediamtx_api = os.environ.get("G1_MEDIAMTX_API", f"http://{mediamtx_host}:9997").rstrip("/")
     mediamtx_webrtc = os.environ.get("G1_MEDIAMTX_WEBRTC", f"http://{mediamtx_host}:8889").rstrip("/")
+
+    video_src_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "services", "video-src")
+    )
+    if video_src_dir not in sys.path:
+        sys.path.insert(0, video_src_dir)
+    try:
+        import camera_ctrl as _camera_ctrl
+    except ImportError:
+        _camera_ctrl = None
+        print(f"camera controls unavailable (missing {video_src_dir}/camera_ctrl.py)", flush=True)
+    else:
+        _camera_ctrl.configure_settings_db(robot.cameras.path)
+        try:
+            for topic, saved in robot.cameras.load_all().items():
+                if not saved or not _camera_ctrl.topic_controllable(topic):
+                    continue
+                try:
+                    result = _camera_ctrl.camera_update(topic, saved, persist=False)
+                    print(
+                        f"camera restored {result.get('path')} "
+                        f"({result.get('camera') or 'device'}) from {robot.cameras.path}",
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"camera restore skipped {topic}: {exc}", flush=True)
+        except Exception as exc:
+            print(f"camera restore skipped: {exc}", flush=True)
+
+    def _video_path_ok(path: str) -> bool:
+        return bool(path) and ".." not in path and bool(re.fullmatch(r"[A-Za-z0-9_./-]+", path))
 
     def _video_topics() -> list[dict]:
         import urllib.request
@@ -1387,6 +2040,9 @@ def build_app(robot: G1Controller):
                 "name": name,
                 "ready": bool(item.get("ready")),
                 "tracks": item.get("tracks") or [],
+                "controllable": bool(
+                    _camera_ctrl and _camera_ctrl.topic_controllable(name)
+                ),
             })
         return topics
 
@@ -1406,7 +2062,7 @@ def build_app(robot: G1Controller):
         from starlette.responses import Response
 
         path = (request.query_params.get("path") or "").strip().strip("/")
-        if not path or ".." in path or not re.fullmatch(r"[A-Za-z0-9_./-]+", path):
+        if not _video_path_ok(path):
             return JSONResponse({"ok": False, "error": "invalid topic"}, status_code=400)
         offer = await request.body()
 
@@ -1426,14 +2082,86 @@ def build_app(robot: G1Controller):
         status, answer = await asyncio.to_thread(post_offer)
         return Response(answer, status_code=status, media_type="application/sdp")
 
+    async def video_camera_get(request: Request):
+        if _camera_ctrl is None:
+            return JSONResponse(
+                {"ok": False, "error": "camera control module unavailable"},
+                status_code=503,
+            )
+        path = (request.query_params.get("path") or "").strip().strip("/")
+        if not _video_path_ok(path):
+            return JSONResponse({"ok": False, "error": "invalid topic"}, status_code=400)
+
+        def read_status():
+            payload = _camera_ctrl.camera_status(path)
+            payload["saved"] = robot.cameras.load(path)
+            payload["database"] = robot.cameras.path
+            return payload
+
+        try:
+            payload = await asyncio.to_thread(read_status)
+        except LookupError as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=404)
+        except OSError as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=503)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=500)
+        return JSONResponse(payload)
+
+    async def video_camera_put(request: Request):
+        if _camera_ctrl is None:
+            return JSONResponse(
+                {"ok": False, "error": "camera control module unavailable"},
+                status_code=503,
+            )
+        path = (request.query_params.get("path") or "").strip().strip("/")
+        if not _video_path_ok(path):
+            return JSONResponse({"ok": False, "error": "invalid topic"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"ok": False, "error": "body must be an object"}, status_code=400)
+        allowed = ("zoom", "focus", "focus_auto", "exposure", "gain", "exposure_auto")
+        updates = {key: body[key] for key in allowed if key in body}
+        if not updates:
+            return JSONResponse(
+                {"ok": False, "error": f"provide one of: {', '.join(allowed)}"},
+                status_code=400,
+            )
+
+        def apply_update():
+            # Apply to the device, then persist beside interfaces/scale in config.db.
+            payload = _camera_ctrl.camera_update(path, updates, persist=False)
+            saved = robot.cameras.merge(path, updates)
+            payload["saved"] = saved
+            payload["database"] = robot.cameras.path
+            return payload
+
+        try:
+            payload = await asyncio.to_thread(apply_update)
+        except LookupError as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=404)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=400)
+        except OSError as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=503)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=500)
+        return JSONResponse(payload)
+
     routes = [
         WebSocketRoute(saved_interfaces["ws"]["path"], control_ws),
         Route("/config/interfaces", interfaces_get, methods=["GET"]),
         Route("/config/interfaces", interfaces_put, methods=["PUT"]),
+        Route("/config/scale", scale_get, methods=["GET"]),
+        Route("/config/scale", scale_put, methods=["PUT"]),
         Route("/", root, methods=["GET"]),
         Route("/openapi.json", openapi_json, methods=["GET"]),
         Route("/docs", docs_page, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
+        Route("/odom", odom_get, methods=["GET"]),
         Route("/wireless", wireless, methods=["POST"]),
         Route("/cmd_vel", cmd_vel, methods=["POST"]),
         Route("/cmd_vel/stop", cmd_vel_stop, methods=["POST"]),
@@ -1445,6 +2173,8 @@ def build_app(robot: G1Controller):
         Route("/logs", logs_get, methods=["GET"]),
         Route("/video/paths", video_paths, methods=["GET"]),
         Route("/video/whep", video_whep, methods=["POST"]),
+        Route("/video/camera", video_camera_get, methods=["GET"]),
+        Route("/video/camera", video_camera_put, methods=["PUT"]),
     ]
     console_dir = _console_web_dir()
     if console_dir:

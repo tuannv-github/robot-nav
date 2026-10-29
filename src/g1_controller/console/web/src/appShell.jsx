@@ -46,6 +46,31 @@ function Rail({ tabs, tab, setTab, brand }) {
   );
 }
 
+const LINK_ITEMS = [
+  { id: "http", label: "HTTP" },
+  { id: "ws", label: "WebSocket" },
+  { id: "zmq", label: "ZMQ" },
+];
+
+function linkCards(state) {
+  const offline = state.link !== "live";
+  const links = (state.health && state.health.links) || null;
+  return LINK_ITEMS.map((item) => {
+    const row = links && links[item.id];
+    if (offline || !row) {
+      return { ...item, state: offline ? "bad" : "warn", count: "—", title: item.label };
+    }
+    const up = !!row.up;
+    const count = row.connections == null ? 0 : row.connections;
+    return {
+      ...item,
+      state: up ? "ok" : "bad",
+      count: String(count),
+      title: row.error ? item.label + " " + row.error : item.label + (up ? " up" : " down"),
+    };
+  });
+}
+
 function App() {
   const config = window.RAPP_CONFIG;
   const tabs = config.tabs || [];
@@ -54,6 +79,8 @@ function App() {
   const [tab, setTab] = useState(tabs[0]?.id);
   const colors = useMemo(() => buildColors(dark, config.theme?.accent || "Energy green"), [dark, config.theme]);
   const actions = useMemo(() => ({ setState, goToTab: setTab }), []);
+  useBridgeLive(actions);
+  const links = linkCards(state);
   const activeTab = tabs.find((x) => x.id === tab) || tabs[0];
   const TabComp = activeTab ? window[activeTab.component] : null;
   const fit = activeTab?.id === "control" || activeTab?.id === "video";
@@ -74,6 +101,14 @@ function App() {
             <div className="crumb">{activeTab?.label || config.brand.title}</div>
             {config.site?.label && <span className="site-badge">{config.site.label}</span>}
             <div className="topbar-right">
+              <div className="topbar-links" aria-label="Interface connections">
+                {links.map((item) => (
+                  <div className="link-cell" key={item.id} title={item.title}>
+                    <StatusDot state={item.state} label={item.label} />
+                    <span className="link-n">{item.count}</span>
+                  </div>
+                ))}
+              </div>
               <a className="icon-btn" href="/docs">Swagger</a>
               <SiteClock tz={config.site?.clockTz} />
               <button
