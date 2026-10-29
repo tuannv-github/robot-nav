@@ -1,0 +1,37 @@
+# ZMQ control JSON -> ROS 2 /cmd_vel.
+# Subscribes to the broker control PUB on this host (tcp://127.0.0.1:5603).
+services:
+  robot-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: robot-bridge:local
+    container_name: ${ROBOT_BRIDGE_CONTAINER_NAME:-robot-bridge}
+    network_mode: host
+    volumes:
+      - /dev/shm:/dev/shm
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ZMQ_CONTROL_SUB: ${ZMQ_CONTROL_SUB:-tcp://127.0.0.1:5603}
+      ZMQ_LIDAR_SUB: ${ZMQ_LIDAR_SUB:-tcp://127.0.0.1:5600}
+      CMD_VEL_TOPIC: ${CMD_VEL_TOPIC:-/cmd_vel}
+      LIDAR_TOPIC: ${LIDAR_TOPIC:-/livox/lidar}
+      LIDAR_FRAME: ${LIDAR_FRAME:-livox_frame}
+      LIDAR_FRAME_SEC: ${LIDAR_FRAME_SEC:-0.1}
+      ODOM_FRAME: ${ODOM_FRAME:-odom}
+      IDLE_TIMEOUT_SEC: ${IDLE_TIMEOUT_SEC:-0.5}
+      STICK_LINEAR_SCALE: ${STICK_LINEAR_SCALE:-0.6}
+      STICK_YAW_SCALE: ${STICK_YAW_SCALE:-1.0}
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      DDS_INTERFACE: ${DDS_INTERFACE:-ens12f0}
+      DDS_PEERS: ${DDS_PEERS:-10.1.100.220}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; os.stat('/tmp/robot-bridge-healthy')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 8s

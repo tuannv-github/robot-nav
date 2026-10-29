@@ -2,6 +2,7 @@
 # Lidar subscribers connect to tcp://<host>:5600
 # Lidar ingest (robot) connects to tcp://<host>:5601
 # Control publishers connect to tcp://<host>:5602
+# ROS 2 control bridge subscribes to tcp://<host>:5603
 services:
   zmq:
     build:
@@ -17,6 +18,7 @@ services:
       ZMQ_LIDAR_PUB: ${ZMQ_LIDAR_PUB:-tcp://0.0.0.0:5600}
       ZMQ_LIDAR_PULL: ${ZMQ_LIDAR_PULL:-tcp://0.0.0.0:5601}
       ZMQ_CONTROL_SUB: ${ZMQ_CONTROL_SUB:-tcp://0.0.0.0:5602}
+      ZMQ_CONTROL_PUB: ${ZMQ_CONTROL_PUB:-tcp://0.0.0.0:5603}
       ZMQ_CONTROL_PUSH: ${ZMQ_CONTROL_PUSH:-tcp://10.1.100.211:8082}
       ZMQ_STATS_SEC: ${ZMQ_STATS_SEC:-5}
     restart: unless-stopped

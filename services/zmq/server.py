@@ -9,6 +9,7 @@ Lidar
 Control
   SUB  tcp://0.0.0.0:5602   publishers send a JSON object
                             {type: cmd_vel|stick|stop, ...}
+  PUB  tcp://0.0.0.0:5603   same JSON, for the ROS 2 control bridge
   PUSH tcp://<robot>:8082   forwarded to the G1 controller PULL socket
 
 A Livox packet is the Mid-360 UDP payload (data_type 1: Cartesian, mm).
@@ -55,6 +56,7 @@ def main() -> None:
     lidar_pub_ep = _env("ZMQ_LIDAR_PUB", "tcp://0.0.0.0:5600")
     lidar_pull_ep = _env("ZMQ_LIDAR_PULL", "tcp://0.0.0.0:5601")
     control_sub_ep = _env("ZMQ_CONTROL_SUB", "tcp://0.0.0.0:5602")
+    control_pub_ep = _env("ZMQ_CONTROL_PUB", "tcp://0.0.0.0:5603")
     control_push_ep = _env("ZMQ_CONTROL_PUSH", "tcp://10.1.100.211:8082")
     stats_sec = float(os.environ.get("ZMQ_STATS_SEC", "5"))
     health = os.environ.get("ZMQ_HEALTH_FILE", "/tmp/zmq-healthy")
@@ -67,6 +69,7 @@ def main() -> None:
     pull = ctx.socket(zmq.PULL)
     sub = ctx.socket(zmq.SUB)
     push = ctx.socket(zmq.PUSH)
+    control_pub = None
     for sock, hwm in ((pub, 2000), (pull, 2000), (sub, 200), (push, 200)):
         sock.setsockopt(zmq.LINGER, 0)
         sock.setsockopt(zmq.SNDHWM, hwm)
@@ -77,6 +80,13 @@ def main() -> None:
     pub.bind(lidar_pub_ep)
     pull.bind(lidar_pull_ep)
     sub.bind(control_sub_ep)
+    if control_pub_ep.lower() not in ("", "off", "none"):
+        control_pub = ctx.socket(zmq.PUB)
+        control_pub.setsockopt(zmq.LINGER, 0)
+        control_pub.setsockopt(zmq.SNDHWM, 200)
+        control_pub.bind(control_pub_ep)
+    else:
+        control_pub_ep = ""
     if control_push_ep.lower() not in ("", "off", "none"):
         push.connect(control_push_ep)
     else:
@@ -88,6 +98,7 @@ def main() -> None:
     print(f"lidar pub  {lidar_pub_ep}", flush=True)
     print(f"lidar pull {lidar_pull_ep}", flush=True)
     print(f"control sub  {control_sub_ep}", flush=True)
+    print(f"control pub  {control_pub_ep or 'off'}", flush=True)
     print(f"control push {control_push_ep or 'off'}", flush=True)
 
     poller = zmq.Poller()
@@ -142,6 +153,11 @@ def main() -> None:
                 if not _json_object(body):
                     control_bad += 1
                     continue
+                if control_pub is not None:
+                    try:
+                        control_pub.send(body, flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        pass
                 if not control_push_ep:
                     control_n += 1
                     continue
@@ -174,8 +190,9 @@ def main() -> None:
             control_n = control_drop = control_bad = 0
             window = now
 
-    for sock in (pub, pull, sub, push):
-        sock.close(linger=0)
+    for sock in (pub, pull, sub, push, control_pub):
+        if sock is not None:
+            sock.close(linger=0)
     ctx.term()
     try:
         os.remove(health)
