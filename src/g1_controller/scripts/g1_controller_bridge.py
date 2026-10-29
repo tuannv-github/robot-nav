@@ -2138,7 +2138,7 @@ def build_app(robot: G1Controller):
             return JSONResponse({"detail": str(exc)}, status_code=400)
         return JSONResponse({"ok": True, **saved})
 
-    mediamtx_host = os.environ.get("G1_MEDIAMTX_HOST", "10.1.101.173")
+    mediamtx_host = os.environ.get("G1_MEDIAMTX_HOST", "10.1.137.133")
     mediamtx_api = os.environ.get("G1_MEDIAMTX_API", f"http://{mediamtx_host}:9997").rstrip("/")
     mediamtx_webrtc = os.environ.get("G1_MEDIAMTX_WEBRTC", f"http://{mediamtx_host}:8889").rstrip("/")
 

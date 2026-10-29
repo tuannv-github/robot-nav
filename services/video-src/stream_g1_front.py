@@ -7,7 +7,7 @@ Supports either:
 
 Publishes H.264 with WebRTC (WHIP). Viewers use:
 
-    rtsp://10.1.101.173:8554/stream/g1/front
+    rtsp://10.1.137.133:8554/stream/g1/front
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC
 
-DEFAULT_HOST = "10.1.101.173"
+DEFAULT_HOST = "10.1.137.133"
 DEFAULT_PATH = "/stream/g1/front"
 DEFAULT_WEBRTC_PORT = 8889
 # Kiyo V2 / BRIO: 1080p MJPEG @ 30 with a higher H.264 bitrate for clearer WebRTC.

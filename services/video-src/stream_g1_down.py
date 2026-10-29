@@ -5,7 +5,7 @@ Selects USB 8086:0b3a (Bus 002 Device 004 when that address is present).
 The color node is the YUYV capture interface, not the depth or infrared nodes.
 Viewers use the same path:
 
-    rtsp://10.1.101.173:8554/stream/g1/down
+    rtsp://10.1.137.133:8554/stream/g1/down
 """
 
 from __future__ import annotations

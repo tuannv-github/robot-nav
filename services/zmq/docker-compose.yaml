@@ -1,0 +1,28 @@
+# ZMQ broker on the lab server.
+# Lidar subscribers connect to tcp://<host>:5600
+# Lidar ingest (robot) connects to tcp://<host>:5601
+# Control publishers connect to tcp://<host>:5602
+services:
+  zmq:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zmq-service:local
+    container_name: ${ZMQ_CONTAINER_NAME:-zmq-service}
+    network_mode: host
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ZMQ_LIDAR_PUB: ${ZMQ_LIDAR_PUB:-tcp://0.0.0.0:5600}
+      ZMQ_LIDAR_PULL: ${ZMQ_LIDAR_PULL:-tcp://0.0.0.0:5601}
+      ZMQ_CONTROL_SUB: ${ZMQ_CONTROL_SUB:-tcp://0.0.0.0:5602}
+      ZMQ_CONTROL_PUSH: ${ZMQ_CONTROL_PUSH:-tcp://10.1.100.211:8082}
+      ZMQ_STATS_SEC: ${ZMQ_STATS_SEC:-5}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.stat('/tmp/zmq-healthy')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
