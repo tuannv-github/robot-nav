@@ -734,6 +734,172 @@ class CameraStore:
         return current
 
 
+LAYOUT_AXIS = (1, 2, 3, 4)
+SLOT_CAP = 16
+# Older saves stored only a tile count. These are the grids that count used.
+COUNT_SHAPE = {1: (1, 1), 2: (1, 2), 4: (2, 2), 8: (2, 4), 16: (4, 4)}
+_TOPIC_RE = re.compile(r"[A-Za-z0-9_./-]+")
+
+
+def _clean_topic(value) -> str:
+    name = str(value or "").strip().strip("/")
+    if not name:
+        return ""
+    if ".." in name or not _TOPIC_RE.fullmatch(name):
+        raise ValueError(f"invalid topic: {name}")
+    return name
+
+
+class VideoLayoutStore:
+    """Row and column counts, and which topic each tile plays.
+
+    Stored in the same SQLite DB as camera controls. ``slots`` is always 16
+    entries so shrinking the grid does not forget the hidden tiles.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._lock = threading.Lock()
+        with self._connect() as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS video_layout (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    count INTEGER NOT NULL,
+                    slots TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            names = {row[1] for row in db.execute("PRAGMA table_info(video_layout)")}
+            if "rows" not in names:
+                db.execute("ALTER TABLE video_layout ADD COLUMN rows INTEGER NOT NULL DEFAULT 0")
+            if "cols" not in names:
+                db.execute("ALTER TABLE video_layout ADD COLUMN cols INTEGER NOT NULL DEFAULT 0")
+            db.commit()
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, timeout=5)
+        db.row_factory = sqlite3.Row
+        return db
+
+    @staticmethod
+    def _slots(raw) -> list:
+        if not isinstance(raw, list):
+            return [""] * 16
+        clean = []
+        for item in raw[:16]:
+            clean.append(_clean_topic(item))
+        while len(clean) < SLOT_CAP:
+            clean.append("")
+        return clean
+
+    @staticmethod
+    def _axis(value) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("rows and columns must be from 1 to 4") from exc
+        if number not in LAYOUT_AXIS:
+            raise ValueError("rows and columns must be from 1 to 4")
+        return number
+
+    @staticmethod
+    def _shape(count: int, rows, cols) -> tuple[int, int]:
+        try:
+            row_n = int(rows) if rows is not None else 0
+            col_n = int(cols) if cols is not None else 0
+        except (TypeError, ValueError):
+            row_n, col_n = 0, 0
+        if row_n in LAYOUT_AXIS and col_n in LAYOUT_AXIS and row_n * col_n <= SLOT_CAP:
+            # A layout saved before rows/cols existed has both defaults at 0,
+            # or 1x1 left behind while count still describes the old grid.
+            if row_n == 1 and col_n == 1 and count in COUNT_SHAPE and count != 1:
+                return COUNT_SHAPE[count]
+            if row_n and col_n:
+                return row_n, col_n
+        return COUNT_SHAPE.get(count, (1, 1))
+
+    def load(self) -> dict:
+        with self._lock:
+            with self._connect() as db:
+                row = db.execute(
+                    "SELECT count, slots, rows, cols FROM video_layout WHERE id = 1"
+                ).fetchone()
+        if row is None:
+            return {"rows": 1, "cols": 1, "count": 1, "slots": [""] * SLOT_CAP}
+        try:
+            count = int(row["count"])
+        except (TypeError, ValueError):
+            count = 1
+        rows, cols = self._shape(count, row["rows"], row["cols"])
+        try:
+            payload = json.loads(row["slots"])
+        except (TypeError, json.JSONDecodeError):
+            payload = []
+        return {
+            "rows": rows,
+            "cols": cols,
+            "count": rows * cols,
+            "slots": self._slots(payload),
+        }
+
+    def save(self, updates: dict) -> dict:
+        if not isinstance(updates, dict):
+            raise ValueError("layout must be an object")
+        current = self.load()
+        if "rows" in updates and updates["rows"] is not None:
+            current["rows"] = self._axis(updates["rows"])
+        if "cols" in updates and updates["cols"] is not None:
+            current["cols"] = self._axis(updates["cols"])
+        if (
+            "count" in updates
+            and updates["count"] is not None
+            and "rows" not in updates
+            and "cols" not in updates
+        ):
+            try:
+                count = int(updates["count"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("count must be 1, 2, 4, 8, or 16") from exc
+            if count not in COUNT_SHAPE:
+                raise ValueError("count must be 1, 2, 4, 8, or 16")
+            current["rows"], current["cols"] = COUNT_SHAPE[count]
+        if current["rows"] * current["cols"] > SLOT_CAP:
+            raise ValueError("rows times columns cannot exceed 16")
+        current["count"] = current["rows"] * current["cols"]
+        if "slots" in updates and updates["slots"] is not None:
+            if not isinstance(updates["slots"], list):
+                raise ValueError("slots must be a list")
+            current["slots"] = self._slots(updates["slots"])
+        with self._lock:
+            with self._connect() as db:
+                db.execute(
+                    """
+                    INSERT INTO video_layout (id, count, slots, rows, cols, updated_at)
+                    VALUES (1, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        count = excluded.count,
+                        slots = excluded.slots,
+                        rows = excluded.rows,
+                        cols = excluded.cols,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        current["count"],
+                        json.dumps(current["slots"]),
+                        current["rows"],
+                        current["cols"],
+                        time.time(),
+                    ),
+                )
+                db.commit()
+        return current
+
+
 class ZmqInterface:
     """PULL socket. Clients PUSH the same JSON control messages used on the WebSocket."""
 
@@ -1137,6 +1303,7 @@ class G1Controller:
         self.interfaces = InterfaceStore(db_path)
         self.scales = ScaleStore(db_path)
         self.cameras = CameraStore(db_path)
+        self.video_layout = VideoLayoutStore(db_path)
         self.http_clients = HttpClients()
         self.local_js = LocalJoystick(self)
         self.zmq_iface = ZmqInterface(self)
@@ -1767,6 +1934,30 @@ def _openapi_spec() -> dict:
                     },
                 ),
             },
+            "/video/layout": {
+                "get": op("Video", "Read the multi-stream grid saved in config.db"),
+                "put": op(
+                    "Video",
+                    "Save the row and column counts and the topic for each tile",
+                    requestBody={
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "rows": {"type": "integer", "minimum": 1, "maximum": 4},
+                                        "cols": {"type": "integer", "minimum": 1, "maximum": 4},
+                                        "slots": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    },
+                ),
+            },
             "/video/camera": {
                 "get": op("Video", "Read V4L2 camera controls for a topic", parameters=camera_q),
                 "put": op(
@@ -2198,12 +2389,43 @@ def build_app(robot: G1Controller):
             })
         return topics
 
+    async def video_layout_get(_request: Request):
+        payload = await asyncio.to_thread(robot.video_layout.load)
+        return JSONResponse({"ok": True, "database": robot.video_layout.path, **payload})
+
+    async def video_layout_put(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"ok": False, "error": "body must be an object"}, status_code=400)
+        updates = {}
+        if "rows" in body:
+            updates["rows"] = body["rows"]
+        if "cols" in body:
+            updates["cols"] = body["cols"]
+        if "count" in body:
+            updates["count"] = body["count"]
+        if "slots" in body:
+            updates["slots"] = body["slots"]
+        if not updates:
+            return JSONResponse(
+                {"ok": False, "error": "provide rows, cols, or slots"},
+                status_code=400,
+            )
+        try:
+            payload = await asyncio.to_thread(robot.video_layout.save, updates)
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "database": robot.video_layout.path, **payload})
+
     async def video_paths(_request: Request):
         try:
             topics = await asyncio.to_thread(_video_topics)
         except Exception as exc:
             return JSONResponse(
-                {"ok": False, "topics": [], "error": str(exc)},
+                {"ok": False, "topics": [], "host": mediamtx_host, "error": str(exc)},
                 status_code=502,
             )
         return JSONResponse({"ok": True, "topics": topics, "host": mediamtx_host})
@@ -2363,6 +2585,8 @@ def build_app(robot: G1Controller):
         Route("/arm/{slug}", arm_post, methods=["POST"]),
         Route("/fsm", fsm_get, methods=["GET"]),
         Route("/logs", logs_get, methods=["GET"]),
+        Route("/video/layout", video_layout_get, methods=["GET"]),
+        Route("/video/layout", video_layout_put, methods=["PUT"]),
         Route("/video/paths", video_paths, methods=["GET"]),
         Route("/video/whep", video_whep, methods=["POST"]),
         Route("/video/camera", video_camera_get, methods=["GET"]),

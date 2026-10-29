@@ -61,17 +61,115 @@ async function subscribeWhep(topic, video) {
   return pc;
 }
 
+const LAYOUT_AXIS = [1, 2, 3, 4];
+
 function ctrlMeta(camera, name) {
   return camera && camera.controls && camera.controls[name] ? camera.controls[name] : null;
 }
 
-function VideoTab() {
+function emptySlots() {
+  return Array(16).fill("");
+}
+
+function StreamTile({ topic, topics, selected, onSelect, onTopic }) {
   const videoRef = useRef(null);
   const pcRef = useRef(null);
+  const [status, setStatus] = useState(topic ? "connecting" : "idle");
+  const [error, setError] = useState("");
+  const known = topics.some((item) => item.name === topic);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return undefined;
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    video.srcObject = null;
+    if (!topic) {
+      setStatus("idle");
+      setError("");
+      return undefined;
+    }
+    let cancelled = false;
+    setStatus("connecting");
+    setError("");
+    subscribeWhep(topic, video).then((pc) => {
+      if (cancelled) {
+        pc.close();
+        return;
+      }
+      pcRef.current = pc;
+      setStatus("live");
+      pc.addEventListener("connectionstatechange", () => {
+        if (cancelled) return;
+        if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+          setStatus(pc.connectionState);
+        } else if (pc.connectionState === "connected") {
+          setStatus("live");
+        }
+      });
+    }).catch((exc) => {
+      if (!cancelled) {
+        setStatus("error");
+        setError(String(exc.message || exc));
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (pcRef.current) {
+        pcRef.current.close();
+        pcRef.current = null;
+      }
+      if (video.srcObject) video.srcObject = null;
+    };
+  }, [topic]);
+
+  return (
+    <div
+      className={"video-cell" + (selected ? " is-selected" : "")}
+      onClick={onSelect}
+    >
+      <div className="video-cell-bar">
+        <select
+          className="joy-select"
+          aria-label="Stream topic"
+          value={topic}
+          onClick={(event) => event.stopPropagation()}
+          onChange={(event) => onTopic(event.target.value)}
+        >
+          <option value="">{topics.length ? "Select a topic" : "No topics"}</option>
+          {topic && !known ? <option value={topic}>{topic}</option> : null}
+          {topics.map((item) => (
+            <option key={item.name} value={item.name}>
+              {(item.ready ? "" : "offline · ")
+                + item.name
+                + (item.controllable ? " · cam" : "")}
+            </option>
+          ))}
+        </select>
+        <span className={"video-status video-status-" + status}>{status}</span>
+      </div>
+      <div className="video-stage">
+        <video ref={videoRef} className="video-player" autoPlay muted playsInline />
+        {!topic ? <p className="video-empty">No stream</p> : null}
+        {error ? <p className="video-error">{error}</p> : null}
+      </div>
+    </div>
+  );
+}
+
+function VideoTab() {
   const putTimer = useRef(null);
+  const filledDefault = useRef(false);
+  const layoutSig = useRef("");
   const [topics, setTopics] = useState([]);
-  const [topic, setTopic] = useState("");
-  const [status, setStatus] = useState("idle");
+  const [server, setServer] = useState("");
+  const [rows, setRows] = useState(1);
+  const [cols, setCols] = useState(1);
+  const [slots, setSlots] = useState(emptySlots);
+  const [selected, setSelected] = useState(0);
+  const [layoutReady, setLayoutReady] = useState(false);
   const [error, setError] = useState("");
   const [camera, setCamera] = useState(null);
   const [draft, setDraft] = useState({ zoom: null, focus: null, focus_auto: 0 });
@@ -116,13 +214,8 @@ function VideoTab() {
         if (stopped) return;
         const next = Array.isArray(payload.topics) ? payload.topics : [];
         setTopics(next);
+        if (payload.host) setServer(String(payload.host));
         if (!payload.ok) setError(payload.error || "Could not list topics");
-        setTopic((current) => {
-          if (current && next.some((item) => item.name === current)) return current;
-          if (next.some((item) => item.name === PREFERRED_TOPIC)) return PREFERRED_TOPIC;
-          const ready = next.find((item) => item.ready);
-          return (ready || next[0] || {}).name || "";
-        });
       } catch (exc) {
         if (!stopped) setError(String(exc.message || exc));
       }
@@ -135,6 +228,100 @@ function VideoTab() {
       clearInterval(timer);
     };
   }, []);
+
+  const adoptLayout = useCallback((payload) => {
+    const nextRows = LAYOUT_AXIS.indexOf(Number(payload.rows)) >= 0 ? Number(payload.rows) : 1;
+    const nextCols = LAYOUT_AXIS.indexOf(Number(payload.cols)) >= 0 ? Number(payload.cols) : 1;
+    const nextSlots = emptySlots();
+    (Array.isArray(payload.slots) ? payload.slots : []).slice(0, 16).forEach((item, index) => {
+      nextSlots[index] = String(item || "");
+    });
+    const sig = nextRows + "x" + nextCols + "\n" + nextSlots.join("\n");
+    if (sig === layoutSig.current) return;
+    layoutSig.current = sig;
+    setRows(nextRows);
+    setCols(nextCols);
+    setSlots(nextSlots);
+    setSelected((index) => Math.min(index, nextRows * nextCols - 1));
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    fetch("/video/layout")
+      .then((response) => response.json())
+      .then((payload) => {
+        if (stopped) return;
+        if (payload.ok) adoptLayout(payload);
+        setLayoutReady(true);
+      })
+      .catch((exc) => {
+        if (!stopped) setError(String(exc.message || exc));
+        setLayoutReady(true);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, [adoptLayout]);
+
+  useEffect(() => {
+    if (!layoutReady) return undefined;
+    let stopped = false;
+    async function refresh() {
+      try {
+        const response = await fetch("/video/layout");
+        const payload = await response.json();
+        if (stopped || !payload.ok) return;
+        adoptLayout(payload);
+      } catch (_exc) { /* keep the last shared layout */ }
+    }
+    const timer = setInterval(refresh, 2000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [layoutReady, adoptLayout]);
+
+  const saveLayout = useCallback(async (nextRows, nextCols, nextSlots) => {
+    const stored = emptySlots();
+    nextSlots.slice(0, 16).forEach((item, index) => {
+      stored[index] = String(item || "");
+    });
+    layoutSig.current = nextRows + "x" + nextCols + "\n" + stored.join("\n");
+    try {
+      const response = await fetch("/video/layout", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows: nextRows, cols: nextCols, slots: stored }),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) {
+        layoutSig.current = "";
+        setError(payload.error || "could not save stream layout");
+        return;
+      }
+      adoptLayout(payload);
+      setError("");
+    } catch (exc) {
+      layoutSig.current = "";
+      setError(String(exc.message || exc));
+    }
+  }, [adoptLayout]);
+
+  useEffect(() => {
+    if (!layoutReady || filledDefault.current || !topics.length) return;
+    filledDefault.current = true;
+    if (slots.some((item) => item)) return;
+    const preferred = topics.some((item) => item.name === PREFERRED_TOPIC)
+      ? PREFERRED_TOPIC
+      : ((topics.find((item) => item.ready) || topics[0] || {}).name || "");
+    if (!preferred) return;
+    const next = slots.slice();
+    next[0] = preferred;
+    setSlots(next);
+    saveLayout(rows, cols, next);
+  }, [layoutReady, topics, slots, rows, cols, saveLayout]);
+
+  const topic = slots[selected] || "";
 
   useEffect(() => {
     if (!topic) {
@@ -151,54 +338,6 @@ function VideoTab() {
       clearInterval(timer);
     };
   }, [topic, loadCamera]);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return undefined;
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    video.srcObject = null;
-    if (!topic) {
-      setStatus("idle");
-      return undefined;
-    }
-
-    let cancelled = false;
-    setStatus("connecting");
-    setError("");
-    subscribeWhep(topic, video).then((pc) => {
-      if (cancelled) {
-        pc.close();
-        return;
-      }
-      pcRef.current = pc;
-      setStatus("live");
-      pc.addEventListener("connectionstatechange", () => {
-        if (cancelled) return;
-        if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-          setStatus(pc.connectionState);
-        } else if (pc.connectionState === "connected") {
-          setStatus("live");
-        }
-      });
-    }).catch((exc) => {
-      if (!cancelled) {
-        setStatus("error");
-        setError(String(exc.message || exc));
-      }
-    });
-
-    return () => {
-      cancelled = true;
-      if (pcRef.current) {
-        pcRef.current.close();
-        pcRef.current = null;
-      }
-      if (video.srcObject) video.srcObject = null;
-    };
-  }, [topic]);
 
   useEffect(() => () => {
     if (putTimer.current) clearTimeout(putTimer.current);
@@ -286,28 +425,62 @@ function VideoTab() {
   const focus = ctrlMeta(camera, "focus");
   const focusAuto = ctrlMeta(camera, "focus_auto");
   const controllable = !!(camera && camera.controllable);
+  const tileCount = rows * cols;
+  const visible = slots.slice(0, tileCount);
+
+  function chooseAxis(kind, value) {
+    const size = Number(value);
+    const nextRows = kind === "rows" ? size : rows;
+    const nextCols = kind === "cols" ? size : cols;
+    if (nextRows * nextCols > 16) return;
+    setRows(nextRows);
+    setCols(nextCols);
+    setSelected((index) => Math.min(index, nextRows * nextCols - 1));
+    saveLayout(nextRows, nextCols, slots);
+  }
+
+  function chooseSlot(index, nextTopic) {
+    const next = slots.slice();
+    next[index] = nextTopic;
+    setSlots(next);
+    setSelected(index);
+    saveLayout(rows, cols, next);
+  }
 
   return (
     <div className="video-page">
       <div className="video-toolbar">
-        <label className="video-topic">
-          <span className="field-label">Topic</span>
+        <label className="video-server">
+          <span className="field-label">Server</span>
+          <span className="video-server-ip">{server || "—"}</span>
+        </label>
+        <label className="video-count">
+          <span className="field-label">Rows</span>
           <select
             className="joy-select"
-            aria-label="Video topics"
-            value={topic}
-            onChange={(event) => setTopic(event.target.value)}
+            aria-label="Rows"
+            value={rows}
+            onChange={(event) => chooseAxis("rows", event.target.value)}
           >
-            <option value="">{topics.length ? "Select a topic" : "No topics"}</option>
-            {topics.map((item) => (
-              <option key={item.name} value={item.name}>
-                {(item.ready ? "" : "offline · ")
-                  + item.name
-                  + (item.controllable ? " · cam" : "")}
-              </option>
+            {LAYOUT_AXIS.map((size) => (
+              <option key={size} value={size} disabled={size * cols > 16}>{size}</option>
             ))}
           </select>
         </label>
+        <label className="video-count">
+          <span className="field-label">Columns</span>
+          <select
+            className="joy-select"
+            aria-label="Columns"
+            value={cols}
+            onChange={(event) => chooseAxis("cols", event.target.value)}
+          >
+            {LAYOUT_AXIS.map((size) => (
+              <option key={size} value={size} disabled={rows * size > 16}>{size}</option>
+            ))}
+          </select>
+        </label>
+        <span className="video-slot-label">Tile {selected + 1}</span>
         <label className="video-check video-stamp">
           <input
             type="checkbox"
@@ -317,7 +490,6 @@ function VideoTab() {
           />
           <span>Timestamp</span>
         </label>
-        <span className={"video-status video-status-" + status}>{status}</span>
       </div>
 
       {controllable ? (
@@ -402,16 +574,25 @@ function VideoTab() {
         <p className="video-cam-note">No camera controls for this topic.</p>
       ) : null}
 
-      <div className="video-stage">
-        <video
-          ref={videoRef}
-          className="video-player"
-          autoPlay
-          muted
-          playsInline
-        />
-        {!topic ? <p className="video-empty">No stream selected</p> : null}
-        {error ? <p className="video-error">{error}</p> : null}
+      {error ? <p className="video-cam-note video-error-inline">{error}</p> : null}
+
+      <div
+        className="video-grid"
+        style={{
+          gridTemplateColumns: "repeat(" + cols + ", minmax(0, 1fr))",
+          gridTemplateRows: "repeat(" + rows + ", minmax(0, 1fr))",
+        }}
+      >
+        {visible.map((slotTopic, index) => (
+          <StreamTile
+            key={index}
+            topic={slotTopic}
+            topics={topics}
+            selected={index === selected}
+            onSelect={() => setSelected(index)}
+            onTopic={(nextTopic) => chooseSlot(index, nextTopic)}
+          />
+        ))}
       </div>
     </div>
   );

@@ -107,7 +107,7 @@ function App() {
   const links = linkCards(state);
   const activeTab = tabs.find((x) => x.id === tab) || tabs[0];
   const TabComp = activeTab ? window[activeTab.component] : null;
-  const fit = activeTab?.id === "control" || activeTab?.id === "video";
+  const fit = activeTab?.id === "control" || activeTab?.id === "stream";
   const appClass = "app " + (dark ? "theme-dark" : "theme-light") + " density-comfy";
   const appVars = {
     "--accent": colors.accent,

@@ -89,7 +89,7 @@ const RAPP_CONFIG = {
   },
   tabs: [
     { id: "control", label: "Control", icon: ICONS.control, component: "ControlTab" },
-    { id: "video", label: "Video", icon: ICONS.video, component: "VideoTab" },
+    { id: "stream", label: "Stream", icon: ICONS.video, component: "VideoTab" },
     { id: "zmq", label: "ZMQ", icon: ICONS.zmq, component: "ZmqTab" },
     { id: "modes", label: "Modes", icon: ICONS.modes, component: "ModesTab" },
     { id: "settings", label: "Settings", icon: ICONS.settings, component: "SettingsTab" },
