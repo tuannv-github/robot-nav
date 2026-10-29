@@ -20,7 +20,14 @@ CONSOLE_DIR="${PROJECT_DIR}/src/g1_controller/console/web"
 SDK_DIR="${G1_SDK_DIR:-${PROJECT_DIR}/../3thrdparties/unitree_sdk2_python}"
 VIDEO_SRC="${PROJECT_DIR}/services/video-src/stream_g1_front.py"
 VIDEO_DOWN="${PROJECT_DIR}/services/video-src/stream_g1_down.py"
+REPO_DIR="$(cd "${PROJECT_DIR}/.." && pwd)"
+ZMQ_FORWARD="${REPO_DIR}/services/zmq/forward.py"
 export G1_MEDIAMTX_HOST="${G1_MEDIAMTX_HOST:-10.1.101.173}"
+export ZMQ_LIDAR_PUSH="${ZMQ_LIDAR_PUSH:-tcp://10.1.101.173:5601}"
+export ZMQ_SERVER_PUB="${ZMQ_SERVER_PUB:-tcp://10.1.101.173:5600}"
+export LIDAR_UDP_HOST="${LIDAR_UDP_HOST:-192.168.123.164}"
+export LIDAR_UDP_PORT="${LIDAR_UDP_PORT:-56301}"
+export ZMQ_FORWARD_STATUS="${ZMQ_FORWARD_STATUS:-/tmp/g1-zmq-forward.json}"
 
 export G1_CONSOLE_DIR="${CONSOLE_DIR}"
 export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
@@ -65,23 +72,29 @@ fi
 
 # Port the new process will bind. Match --port N, --port=N, and port:=N.
 REST_PORT="${G1_REST_PORT:-8081}"
+DDS_IFACE="${G1_DDS_INTERFACE:-auto}"
 prev=""
 for arg in "$@"; do
   if [[ "${prev}" == "--port" ]]; then
     REST_PORT="${arg}"
   fi
+  if [[ "${prev}" == "--interface" ]]; then
+    DDS_IFACE="${arg}"
+  fi
   case "${arg}" in
     --port=*) REST_PORT="${arg#--port=}" ;;
     port:=*) REST_PORT="${arg#port:=}" ;;
+    --interface=*) DDS_IFACE="${arg#--interface=}" ;;
   esac
   prev="${arg}"
 done
+export G1_DDS_INTERFACE="${DDS_IFACE}"
 
 stop_existing_controller() {
   local pid killed=0
   local -a pids=()
 
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py" || true)
+  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     if kill -0 "${pid}" 2>/dev/null; then
@@ -100,7 +113,7 @@ stop_existing_controller() {
   local i
   for i in $(seq 1 25); do
     local still=0
-    mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py" || true)
+    mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
     for pid in "${pids[@]}"; do
       [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
       if kill -0 "${pid}" 2>/dev/null; then
@@ -114,7 +127,7 @@ stop_existing_controller() {
   done
 
   echo "Existing G1 controller did not exit; sending SIGKILL..."
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py" || true)
+  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     kill -9 "${pid}" 2>/dev/null || true
@@ -131,6 +144,10 @@ fi
 if [[ -f "${VIDEO_DOWN}" ]]; then
   echo "Starting RealSense stream -> whip://${G1_MEDIAMTX_HOST}:8889/stream/g1/down"
   nohup /usr/bin/python3 "${VIDEO_DOWN}" --host "${G1_MEDIAMTX_HOST}" >/tmp/g1-video-src-down.log 2>&1 &
+fi
+if [[ -f "${ZMQ_FORWARD}" ]]; then
+  echo "Starting ZMQ forward lidar+odom -> ${ZMQ_LIDAR_PUSH}"
+  nohup "${PYTHON}" "${ZMQ_FORWARD}" >/tmp/g1-zmq-forward.log 2>&1 &
 fi
 
 if [[ -f "${PROJECT_DIR}/install/setup.bash" ]] && command -v ros2 >/dev/null 2>&1; then

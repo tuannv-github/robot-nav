@@ -26,6 +26,14 @@ const ICONS = {
       <path d="M16 10l5-3v10l-5-3z" />
     </svg>
   ),
+  zmq: (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="6" cy="12" r="2.5" />
+      <circle cx="18" cy="7" r="2.5" />
+      <circle cx="18" cy="17" r="2.5" />
+      <path d="M8.5 12h7M8.2 10.8 15.6 7.8M8.2 13.2l7.4 3" />
+    </svg>
+  ),
 };
 
 const FSM_LABELS = {
@@ -82,6 +90,7 @@ const RAPP_CONFIG = {
   tabs: [
     { id: "control", label: "Control", icon: ICONS.control, component: "ControlTab" },
     { id: "video", label: "Video", icon: ICONS.video, component: "VideoTab" },
+    { id: "zmq", label: "ZMQ", icon: ICONS.zmq, component: "ZmqTab" },
     { id: "modes", label: "Modes", icon: ICONS.modes, component: "ModesTab" },
     { id: "settings", label: "Settings", icon: ICONS.settings, component: "SettingsTab" },
   ],

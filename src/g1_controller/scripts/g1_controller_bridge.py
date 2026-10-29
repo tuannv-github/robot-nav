@@ -744,6 +744,9 @@ class ZmqInterface:
         self.error = ""
         self._peers: set[int] = set()
         self._peer_lock = threading.Lock()
+        self._rx: list[dict] = []
+        self._rx_total = 0
+        self._rx_lock = threading.Lock()
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._mon = None
@@ -804,6 +807,37 @@ class ZmqInterface:
     def connections(self) -> int:
         with self._peer_lock:
             return len(self._peers)
+
+    def _remember(self, body: dict, ok: bool, error: str = "") -> None:
+        kind = str(body.get("type") or body.get("op") or "").strip().lower() or "?"
+        parts = []
+        for key in ("vx", "vy", "w", "wz", "lx", "ly", "rx"):
+            if key not in body or body[key] is None:
+                continue
+            try:
+                parts.append("%s %.2f" % (key, float(body[key])))
+            except (TypeError, ValueError):
+                parts.append("%s %s" % (key, body[key]))
+        item = {
+            "ts": time.time(),
+            "type": kind,
+            "ok": ok,
+            "detail": "  ".join(parts),
+            "error": error,
+        }
+        with self._rx_lock:
+            self._rx.append(item)
+            if len(self._rx) > 40:
+                del self._rx[:-40]
+            self._rx_total += 1
+
+    def control_log(self) -> dict:
+        now = time.time()
+        with self._rx_lock:
+            recent = sum(1 for item in self._rx if now - float(item["ts"]) <= 1.0)
+            messages = list(reversed(self._rx))
+            total = self._rx_total
+        return {"total": total, "hz": recent, "messages": messages}
 
     def _note_peer(self, event: int, value: int, zmq) -> None:
         connected = (zmq.EVENT_ACCEPTED,)
@@ -902,14 +936,18 @@ class ZmqInterface:
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
             if not isinstance(body, dict):
+                self._remember({"type": "?"}, ok=False, error="not an object")
                 continue
             hub = getattr(self.robot, "control_hub", None)
             if hub is None:
+                self._remember(body, ok=False, error="control hub unavailable")
                 continue
             try:
                 hub.apply(body, "zmq")
-            except ValueError:
+            except ValueError as exc:
+                self._remember(body, ok=False, error=str(exc))
                 continue
+            self._remember(body, ok=True)
         self.running = False
 
 
@@ -1665,6 +1703,7 @@ def _openapi_spec() -> dict:
             "/health": {"get": op("Status", "SDK and FSM status")},
             "/fsm": {"get": op("Status", "Current FSM id")},
             "/odom": {"get": op("Status", "Latest sample from each odometry topic")},
+            "/zmq": {"get": op("Status", "ZMQ forward rates and received control messages")},
             "/logs": {"get": op("Status", "Controlled-action log")},
             "/wireless": {
                 "post": op(
@@ -1895,6 +1934,34 @@ class ControlHub:
                 self._sockets.discard(websocket)
 
 
+def _zmq_snapshot(robot: G1Controller) -> dict:
+    path = os.environ.get("ZMQ_FORWARD_STATUS", "/tmp/g1-zmq-forward.json")
+    forward = {"ok": False, "error": "forwarder not running", "age_s": None}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            forward = loaded
+            updated = float(forward.get("updated") or 0)
+            age = time.time() - updated if updated else None
+            forward["age_s"] = None if age is None else round(age, 2)
+            if age is None or age > 3.0:
+                forward["ok"] = False
+                forward["error"] = forward.get("error") or "forwarder stale"
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    iface = robot.zmq_iface
+    return {
+        "ok": True,
+        "listen": iface.endpoint,
+        "running": bool(iface.running),
+        "error": iface.error,
+        "connections": iface.connections(),
+        "forward": forward,
+        "control": iface.control_log(),
+    }
+
+
 def build_app(robot: G1Controller):
     from starlette.applications import Starlette
     from starlette.middleware.cors import CORSMiddleware
@@ -1905,6 +1972,9 @@ def build_app(robot: G1Controller):
 
     async def health(_request: Request):
         return JSONResponse(robot.health())
+
+    async def zmq_get(_request: Request):
+        return JSONResponse(_zmq_snapshot(robot))
 
     async def odom_get(_request: Request):
         return JSONResponse(robot.odom.snapshot())
@@ -2283,6 +2353,7 @@ def build_app(robot: G1Controller):
         Route("/docs", docs_page, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route("/odom", odom_get, methods=["GET"]),
+        Route("/zmq", zmq_get, methods=["GET"]),
         Route("/wireless", wireless, methods=["POST"]),
         Route("/cmd_vel", cmd_vel, methods=["POST"]),
         Route("/cmd_vel/stop", cmd_vel_stop, methods=["POST"]),
