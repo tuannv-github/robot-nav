@@ -76,6 +76,8 @@ function VideoTab() {
   const [camera, setCamera] = useState(null);
   const [draft, setDraft] = useState({ zoom: null, focus: null, focus_auto: 0 });
   const [busy, setBusy] = useState(false);
+  const [timestampOn, setTimestampOn] = useState(true);
+  const [timestampBusy, setTimestampBusy] = useState(false);
 
   const loadCamera = useCallback(async (path, { silent } = {}) => {
     if (!path) {
@@ -202,6 +204,51 @@ function VideoTab() {
     if (putTimer.current) clearTimeout(putTimer.current);
   }, []);
 
+  useEffect(() => {
+    if (!topic) {
+      setTimestampOn(true);
+      return undefined;
+    }
+    let stopped = false;
+    fetch("/video/overlay?path=" + encodeURIComponent(topic))
+      .then((response) => response.json())
+      .then((payload) => {
+        if (stopped || !payload.ok) return;
+        setTimestampOn(!!payload.timestamp);
+      })
+      .catch(() => {});
+    return () => {
+      stopped = true;
+    };
+  }, [topic]);
+
+  const setTimestamp = useCallback(async (enabled) => {
+    if (!topic) return;
+    const previous = timestampOn;
+    setTimestampOn(enabled);
+    setTimestampBusy(true);
+    try {
+      const response = await fetch("/video/overlay?path=" + encodeURIComponent(topic), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ timestamp: enabled }),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) {
+        setTimestampOn(previous);
+        setError(payload.error || "timestamp update failed");
+        return;
+      }
+      setError("");
+      setTimestampOn(!!payload.timestamp);
+    } catch (exc) {
+      setTimestampOn(previous);
+      setError(String(exc.message || exc));
+    } finally {
+      setTimestampBusy(false);
+    }
+  }, [topic, timestampOn]);
+
   const applyControls = useCallback(async (path, body) => {
     setBusy(true);
     try {
@@ -260,6 +307,15 @@ function VideoTab() {
               </option>
             ))}
           </select>
+        </label>
+        <label className="video-check video-stamp">
+          <input
+            type="checkbox"
+            checked={timestampOn}
+            disabled={!topic || timestampBusy}
+            onChange={(event) => setTimestamp(event.target.checked)}
+          />
+          <span>Timestamp</span>
         </label>
         <span className={"video-status video-status-" + status}>{status}</span>
       </div>

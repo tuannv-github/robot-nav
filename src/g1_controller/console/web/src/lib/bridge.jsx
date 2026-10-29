@@ -128,8 +128,11 @@ function useBridgeLive(actions) {
       const next = {};
       try {
         const health = await bridgeSend("/health");
-        next.link = health && health.sdk_ready ? "live" : "offline";
-        next.linkDetail = health && health.sdk_ready ? "Live" : "SDK down";
+        const robot = health && health.robot_link;
+        next.link = "live";
+        next.linkDetail = robot && robot.up
+          ? (robot.fsm_name || "Robot up")
+          : (robot && robot.error) || "Robot down";
         next.health = health;
       } catch (err) {
         next.link = "offline";

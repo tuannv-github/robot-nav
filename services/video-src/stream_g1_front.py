@@ -390,16 +390,28 @@ class WhipSession:
 
 
 class Publisher:
-    def __init__(self, pipeline: str, whip: str, device: str, tune=None) -> None:
+    def __init__(
+        self,
+        pipeline: str,
+        whip: str,
+        device: str,
+        tune=None,
+        stream_path: str = "",
+    ) -> None:
         self.pipeline_text = pipeline
         self.whip = whip
         self.device = device
         self.tune = tune
+        self.stream_path = stream_path.strip().strip("/")
         self.loop = GLib.MainLoop()
         self.pipeline: Gst.Pipeline | None = None
         self.session: WhipSession | None = None
         self.stop_requested = False
         self.failed = False
+        self._stamp_enabled = True
+        self._stamp_applied: bool | None = None
+        self._overlay_mtime: int | None = None
+        self._stamp_timer = 0
 
     def _lock_focus(self) -> bool:
         if self.tune is None:
@@ -419,10 +431,45 @@ class Publisher:
             return
         pad.add_probe(Gst.PadProbeType.BUFFER, self._stamp_frame, stamp)
 
-    @staticmethod
-    def _stamp_frame(_pad: Gst.Pad, _info: Gst.PadProbeInfo, stamp: Gst.Element) -> Gst.PadProbeReturn:
+    def _read_timestamp_flag(self) -> bool:
+        """Poll the console overlay file. The pad probe applies the change."""
+        if not self.stream_path:
+            return True
+        try:
+            from overlay_ctrl import overlay_file, timestamp_enabled
+        except ImportError:
+            return True
+        try:
+            mtime = os.stat(overlay_file()).st_mtime_ns
+        except OSError:
+            mtime = 0
+        if mtime == self._overlay_mtime:
+            return True
+        self._overlay_mtime = mtime
+        enabled = timestamp_enabled(self.stream_path)
+        if enabled != self._stamp_enabled or self._stamp_applied is None:
+            self._stamp_enabled = enabled
+            state = "on" if enabled else "off"
+            print(f"timestamp {state} ({self.stream_path})", flush=True)
+        return True
+
+    def _stamp_frame(
+        self,
+        _pad: Gst.Pad,
+        _info: Gst.PadProbeInfo,
+        stamp: Gst.Element,
+    ) -> Gst.PadProbeReturn:
+        enabled = self._stamp_enabled
+        if enabled != self._stamp_applied:
+            stamp.set_property("silent", not enabled)
+            self._stamp_applied = enabled
+        if not enabled:
+            return Gst.PadProbeReturn.OK
         now = datetime.now()
-        stamp.set_property("text", now.strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}")
+        stamp.set_property(
+            "text",
+            now.strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}",
+        )
         return Gst.PadProbeReturn.OK
 
     def _drop(self) -> None:
@@ -461,6 +508,9 @@ class Publisher:
             self.failed = True
             return False
         self.session = WhipSession(webrtc, self.whip, self._drop)
+        self._stamp_applied = None
+        self._overlay_mtime = None
+        self._read_timestamp_flag()
         self._attach_timestamp()
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -472,7 +522,11 @@ class Publisher:
         elif not self.stop_requested:
             self._lock_focus()
             GLib.timeout_add(500, self._lock_focus)
+            self._stamp_timer = GLib.timeout_add(300, self._read_timestamp_flag)
             self.loop.run()
+        if self._stamp_timer:
+            GLib.source_remove(self._stamp_timer)
+            self._stamp_timer = 0
         bus.remove_signal_watch()
         self.pipeline.set_state(Gst.State.NULL)
         self.pipeline.get_state(2 * Gst.SECOND)
@@ -535,7 +589,13 @@ def main() -> int:
             f"shutter {active.exposure // 10}ms ({active.name})"
         )
 
-    publisher = Publisher(build_pipeline(device), location, device, tune=_tune)
+    publisher = Publisher(
+        build_pipeline(device),
+        location,
+        device,
+        tune=_tune,
+        stream_path=args.path,
+    )
 
     def _stop(_signum: int, _frame: object) -> None:
         publisher.stop()

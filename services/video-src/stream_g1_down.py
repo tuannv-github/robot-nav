@@ -179,7 +179,13 @@ def main() -> int:
     print(f"publish {location}")
     print(f"watch rtsp://{args.host}:8554/{args.path.strip('/')}")
 
-    publisher = Publisher(build_pipeline(device), location, device, tune=None)
+    publisher = Publisher(
+        build_pipeline(device),
+        location,
+        device,
+        tune=None,
+        stream_path=args.path,
+    )
 
     def _stop(_signum: int, _frame: object) -> None:
         publisher.stop()

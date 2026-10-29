@@ -938,6 +938,11 @@ button:focus-visible,
   padding-bottom: 6px;
   white-space: nowrap;
 }
+.video-stamp {
+  padding-bottom: 8px;
+  color: var(--text);
+}
+.video-stamp input { width: 16px; height: 16px; accent-color: var(--accent); }
 .video-cam-note {
   margin: 0;
   font-size: 12px;

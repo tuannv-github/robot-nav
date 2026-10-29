@@ -701,6 +701,16 @@ function ControlTab({ state, actions }) {
         });
       }
 
+      const robotLink = s.health && s.health.robot_link;
+      const canDrive = s.link === "live" && !!(robotLink && robotLink.up);
+      if (!canDrive) {
+        if (lastSig.current !== "blocked") {
+          lastSig.current = "blocked";
+          bridgeHalt();
+        }
+        return;
+      }
+
       if (driveMode === "sport") {
         const speed = Number(s.speed);
         const scale = Number.isFinite(speed) ? speed : 0.2;
@@ -917,6 +927,8 @@ function ControlTab({ state, actions }) {
   }
 
   async function selectMode(mode) {
+    const robotLink = state.health && state.health.robot_link;
+    if (state.link !== "live" || !(robotLink && robotLink.up)) return;
     const fromWalk = mode.confirmFrom && mode.confirmFrom.indexOf(fsmId) >= 0;
     const prompt = mode.confirm && (!mode.confirmFrom || fromWalk) ? mode.confirm : "";
     if (prompt && !window.confirm(prompt)) return;
@@ -975,9 +987,27 @@ function ControlTab({ state, actions }) {
 
   const fsmId = state.health && state.health.fsm_id != null ? Number(state.health.fsm_id) : null;
   const fsmName = fsmLabel(state.health, "Unknown");
-  const offline = state.link !== "live";
+  const robotLink = state.health && state.health.robot_link;
+  const bridgeDown = state.link !== "live";
+  const robotUp = !!(robotLink && robotLink.up);
+  const offline = bridgeDown || !robotUp;
   const driveMode = state.driveMode === "sport" ? "sport" : "stick";
-  const linkState = offline ? "bad" : "ok";
+  let linkState = "bad";
+  let linkLabel = "Offline";
+  let linkTitle = "Bridge unreachable";
+  if (!bridgeDown && !robotLink) {
+    linkState = "warn";
+    linkLabel = "Waiting";
+    linkTitle = "Waiting for the robot";
+  } else if (!bridgeDown && !robotUp) {
+    linkState = "bad";
+    linkLabel = "Not controllable";
+    linkTitle = robotLink.error || "Robot is not answering";
+  } else if (robotUp) {
+    linkState = "ok";
+    linkLabel = "Live";
+    linkTitle = robotLink.fsm_name || "Robot answering";
+  }
   const shown = driveMode === "sport" ? state.sport || {} : state.stick || {};
 
   function knobStyle(stick) {
@@ -993,7 +1023,7 @@ function ControlTab({ state, actions }) {
         <Card className="board-card">
           <div className="panel-head">
             <SectionLabel kicker={fsmId == null ? "fsm" : String(fsmId)}>{fsmName}</SectionLabel>
-            <StatusDot state={linkState} label={state.linkDetail || "Offline"} />
+            <StatusDot state={linkState} label={linkLabel} title={linkTitle} />
           </div>
           {state.modeResult ? (
             <div className={"mode-result" + (state.modeResult.applied ? " is-ok" : " is-bad")}>

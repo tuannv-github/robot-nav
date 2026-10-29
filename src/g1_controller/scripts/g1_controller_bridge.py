@@ -1127,6 +1127,15 @@ class G1Controller:
         self._moving = False
         self._gait = False
         self._thread = threading.Thread(target=self._hold_loop, name="g1-drive", daemon=True)
+        self._fsm_lock = threading.Lock()
+        self._fsm_state = {
+            "up": False,
+            "fsm_id": None,
+            "fsm_name": None,
+            "error": "",
+            "checked_at": 0.0,
+        }
+        self._fsm_thread = threading.Thread(target=self._fsm_loop, name="g1-fsm", daemon=True)
 
     def start(self) -> None:
         import unitree_sdk2py.core.channel as channel
@@ -1164,6 +1173,7 @@ class G1Controller:
             detail=self.network_interface,
             source="bridge",
         )
+        self._fsm_thread.start()
         self._thread.start()
         self.local_js.start()
 
@@ -1216,26 +1226,72 @@ class G1Controller:
             restart = True
         return restart
 
-    def health(self) -> dict:
-        fsm_id = None
-        fsm_name = None
-        if self.ready and self.client is not None:
-            try:
-                with self._lock:
+    def _store_robot(self, **fields) -> None:
+        with self._fsm_lock:
+            self._fsm_state.update(fields)
+            self._fsm_state["checked_at"] = time.time()
+
+    def robot_status(self) -> dict:
+        """Last robot poll. Never calls the SDK."""
+        with self._fsm_lock:
+            state = dict(self._fsm_state)
+        checked = float(state.get("checked_at") or 0.0)
+        age = round(time.time() - checked, 2) if checked else None
+        return {
+            "up": bool(state.get("up")),
+            "fsm_id": state.get("fsm_id"),
+            "fsm_name": state.get("fsm_name"),
+            "error": state.get("error") or "",
+            "age_s": age,
+        }
+
+    def _poll_fsm(self) -> None:
+        """One GetFsmId on this thread. A short timeout keeps the SDK lock free."""
+        if not self.ready or self.client is None:
+            self._store_robot(up=False, fsm_id=None, fsm_name=None, error="SDK not ready")
+            return
+        try:
+            with self._lock:
+                self.client.SetTimeout(1.5)
+                try:
                     code, value = self.client.GetFsmId()
-                if code == 0 and value is not None:
-                    fsm_id = int(value)
-                    fsm_name = FSM_NAMES.get(fsm_id)
-            except Exception as exc:
-                self.last_error = str(exc)
+                finally:
+                    self.client.SetTimeout(10.0)
+        except Exception as exc:
+            message = str(exc)
+            self.last_error = message
+            self._store_robot(up=False, error=message)
+            return
+        if code == 0 and value is not None:
+            fsm_id = int(value)
+            self.last_error = ""
+            self._store_robot(
+                up=True,
+                fsm_id=fsm_id,
+                fsm_name=FSM_NAMES.get(fsm_id),
+                error="",
+            )
+            return
+        message = f"GetFsmId failed ({code})"
+        self.last_error = message
+        self._store_robot(up=False, error=message)
+
+    def _fsm_loop(self) -> None:
+        while not self._stop.is_set():
+            self._poll_fsm()
+            self._stop.wait(1.0)
+
+    def health(self) -> dict:
+        robot_link = self.robot_status()
         hold = dict(self._hold)
         return {
             "ok": True,
             "robot": "g1",
             "sdk_ready": self.ready,
             "network_interface": self.network_interface,
-            "fsm_id": fsm_id,
-            "fsm_name": fsm_name,
+            "fsm_id": robot_link["fsm_id"],
+            "fsm_name": robot_link["fsm_name"],
+            "robot_link": robot_link,
             "drive": {
                 "mode": hold["mode"],
                 "lx": hold["lx"],
@@ -1651,6 +1707,27 @@ def _openapi_spec() -> dict:
                     ],
                 )
             },
+            "/video/overlay": {
+                "get": op("Video", "Read the burned-in timestamp flag for a topic", parameters=camera_q),
+                "put": op(
+                    "Video",
+                    "Show or hide the burned-in timestamp on a topic",
+                    parameters=camera_q,
+                    requestBody={
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "timestamp": {"type": "boolean"},
+                                    },
+                                    "required": ["timestamp"],
+                                }
+                            }
+                        }
+                    },
+                ),
+            },
             "/video/camera": {
                 "get": op("Video", "Read V4L2 camera controls for a topic", parameters=camera_q),
                 "put": op(
@@ -1864,7 +1941,7 @@ def build_app(robot: G1Controller):
         return JSONResponse({"ok": True})
 
     async def cmd_vel_stop(_request: Request):
-        robot.stop_motion(source="http")
+        await asyncio.to_thread(robot.stop_motion, source="http")
         return JSONResponse({"ok": True})
 
     async def sport_catalog(_request: Request):
@@ -1886,14 +1963,14 @@ def build_app(robot: G1Controller):
             body = {}
         if not isinstance(body, dict):
             body = {}
-        code, payload = robot.sport(slug, body)
+        code, payload = await asyncio.to_thread(robot.sport, slug, body)
         return JSONResponse(payload, status_code=code)
 
     async def arm_catalog(_request: Request):
         return JSONResponse({"ok": True, "actions": robot.arm_actions})
 
     async def arm_post(request: Request):
-        code, payload = robot.arm(request.path_params["slug"])
+        code, payload = await asyncio.to_thread(robot.arm, request.path_params["slug"])
         return JSONResponse(payload, status_code=code)
 
     async def root(_request: Request):
@@ -2005,6 +2082,11 @@ def build_app(robot: G1Controller):
     except ImportError:
         _camera_ctrl = None
         print(f"camera controls unavailable (missing {video_src_dir}/camera_ctrl.py)", flush=True)
+    try:
+        import overlay_ctrl as _overlay_ctrl
+    except ImportError:
+        _overlay_ctrl = None
+        print(f"video overlay unavailable (missing {video_src_dir}/overlay_ctrl.py)", flush=True)
     else:
         _camera_ctrl.configure_settings_db(robot.cameras.path)
         try:
@@ -2151,6 +2233,45 @@ def build_app(robot: G1Controller):
             return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=500)
         return JSONResponse(payload)
 
+    async def video_overlay_get(request: Request):
+        if _overlay_ctrl is None:
+            return JSONResponse(
+                {"ok": False, "error": "video overlay module unavailable"},
+                status_code=503,
+            )
+        path = (request.query_params.get("path") or "").strip().strip("/")
+        if not _video_path_ok(path):
+            return JSONResponse({"ok": False, "error": "invalid topic"}, status_code=400)
+        return JSONResponse({
+            "ok": True,
+            "path": path,
+            "timestamp": _overlay_ctrl.timestamp_enabled(path),
+        })
+
+    async def video_overlay_put(request: Request):
+        if _overlay_ctrl is None:
+            return JSONResponse(
+                {"ok": False, "error": "video overlay module unavailable"},
+                status_code=503,
+            )
+        path = (request.query_params.get("path") or "").strip().strip("/")
+        if not _video_path_ok(path):
+            return JSONResponse({"ok": False, "error": "invalid topic"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"ok": False, "error": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict) or "timestamp" not in body:
+            return JSONResponse(
+                {"ok": False, "error": "provide timestamp"},
+                status_code=400,
+            )
+        try:
+            enabled = _overlay_ctrl.set_timestamp(path, body["timestamp"])
+        except ValueError as exc:
+            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "path": path, "timestamp": enabled})
+
     routes = [
         WebSocketRoute(saved_interfaces["ws"]["path"], control_ws),
         Route("/config/interfaces", interfaces_get, methods=["GET"]),
@@ -2175,6 +2296,8 @@ def build_app(robot: G1Controller):
         Route("/video/whep", video_whep, methods=["POST"]),
         Route("/video/camera", video_camera_get, methods=["GET"]),
         Route("/video/camera", video_camera_put, methods=["PUT"]),
+        Route("/video/overlay", video_overlay_get, methods=["GET"]),
+        Route("/video/overlay", video_overlay_put, methods=["PUT"]),
     ]
     console_dir = _console_web_dir()
     if console_dir:

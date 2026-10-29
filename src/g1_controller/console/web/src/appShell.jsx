@@ -52,10 +52,34 @@ const LINK_ITEMS = [
   { id: "zmq", label: "ZMQ" },
 ];
 
+function robotCard(state) {
+  const robot = state.health && state.health.robot_link;
+  if (!robot || robot.age_s == null) {
+    return { id: "robot", label: "Robot", state: "warn", count: "…", title: "Waiting for robot status" };
+  }
+  if (robot.up) {
+    const name = robot.fsm_name || (robot.fsm_id == null ? "up" : String(robot.fsm_id));
+    return {
+      id: "robot",
+      label: "Robot",
+      state: "ok",
+      count: robot.fsm_id == null ? "up" : String(robot.fsm_id),
+      title: "Robot " + name,
+    };
+  }
+  return {
+    id: "robot",
+    label: "Robot",
+    state: "bad",
+    count: "down",
+    title: robot.error || "Robot not responding",
+  };
+}
+
 function linkCards(state) {
   const offline = state.link !== "live";
   const links = (state.health && state.health.links) || null;
-  return LINK_ITEMS.map((item) => {
+  return [robotCard(state)].concat(LINK_ITEMS.map((item) => {
     const row = links && links[item.id];
     if (offline || !row) {
       return { ...item, state: offline ? "bad" : "warn", count: "—", title: item.label };
@@ -68,7 +92,7 @@ function linkCards(state) {
       count: String(count),
       title: row.error ? item.label + " " + row.error : item.label + (up ? " up" : " down"),
     };
-  });
+  }));
 }
 
 function App() {
