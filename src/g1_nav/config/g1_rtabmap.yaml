@@ -2,8 +2,8 @@
 #
 #   ros2 launch g1_nav g1_rtabmap.launch.py
 #
-# lidar_only, localization, database_path, and use_sim_time can still be
-# passed on the command line. Everything else is here.
+# localization, database_path, and use_sim_time can still be passed on the
+# command line. Lidar only is the launch default. Everything else is here.
 #
 # The launch sets these from lidar_only / enable_livox_cloud:
 #   Grid/Sensor, Reg/Strategy, subscribe_rgb, subscribe_depth, subscribe_rgbd,

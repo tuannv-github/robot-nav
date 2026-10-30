@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Continue G1 SLAM on an existing RTAB-Map database. The file is not deleted.
+"""Continue G1 SLAM on an existing database, using the mapping parameters.
+
+Starts in localization so the current odom can lock onto the old map. The
+database is not deleted. After the scan matches, switch to mapping without
+restarting:
+
+    ./utils/set_mode_mapping.sh
 
     source ros2_source.sh
     ros2 launch g1_nav g1_continue.launch.py
-
-    ros2 launch g1_nav g1_continue.launch.py \
-        database_path:=/home/fcp/robot-nav/map_bk/g1_rtabmap_20261031_002906.db
 """
 
 import os
@@ -29,13 +32,20 @@ def _workspace_root():
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _mapping_params():
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'config', 'g1_rtabmap.yaml'))
+
+
 def _launch(context, *args, **kwargs):
     database_path = LaunchConfiguration('database_path').perform(context).strip()
     if not database_path:
         database_path = os.path.join(_workspace_root(), 'map', 'g1_rtabmap.db')
     if not os.path.isfile(database_path):
         raise RuntimeError(f'continue database not found: {database_path}')
-    print(f'[g1_continue] Continuing SLAM on {database_path}')
+    params_file = LaunchConfiguration('params_file').perform(context).strip() or _mapping_params()
+    print(f'[g1_continue] Localizing with mapping parameters, then call /rtabmap/set_mode_mapping')
+    print(f'[g1_continue] Database: {database_path}')
+    print(f'[g1_continue] Parameters: {params_file}')
     return [IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -45,11 +55,11 @@ def _launch(context, *args, **kwargs):
             ])
         ),
         launch_arguments={
-            'localization': 'false',
-            'lidar_only': LaunchConfiguration('lidar_only').perform(context) or 'true',
+            'localization': 'true',
+            'lidar_only': 'true',
             'database_path': database_path,
             'use_sim_time': LaunchConfiguration('use_sim_time').perform(context),
-            'params_file': LaunchConfiguration('params_file').perform(context),
+            'params_file': params_file,
             'rtab_cpu_affinity': LaunchConfiguration('rtab_cpu_affinity').perform(context),
         }.items(),
     )]
@@ -65,7 +75,6 @@ def generate_launch_description():
             '',
             'Existing RTAB-Map database. Empty uses <workspace>/map/g1_rtabmap.db.',
         ),
-        arg('lidar_only', 'true', 'Map from the Mid-360 cloud only.'),
         arg('use_sim_time', 'false', 'Use /clock when true.'),
         arg('params_file', '', 'YAML file. Empty uses config/g1_rtabmap.yaml.'),
         arg('rtab_cpu_affinity', '', 'CPU affinity. Empty uses the YAML value.'),

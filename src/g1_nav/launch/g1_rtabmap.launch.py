@@ -6,14 +6,12 @@ Tunable values live in ``config/g1_rtabmap.yaml`` next to this package.
 Edit that file and relaunch. ``lidar_only``, ``localization``,
 ``database_path``, and ``use_sim_time`` can still be set on the command line.
 
+The Mid-360 cloud is the default. Pass ``lidar_only:=false`` to also use the camera.
+
 Prerequisites::
 
     # robot-bridge publishes /livox/lidar and odom -> base_link (z held at 0).
-    ros2 launch g1_nav realsense.launch.py
     ros2 launch g1_nav g1_rtabmap.launch.py
-
-    # Mid-360 only, no camera
-    ros2 launch g1_nav g1_rtabmap.launch.py lidar_only:=true
 
     # keep an existing map
     ros2 launch g1_nav g1_rtabmap.launch.py localization:=true database_path:=/path/g1_rtabmap.db
@@ -313,8 +311,9 @@ def generate_launch_description():
         arg('rtab_cpu_affinity', '', 'CPU affinity for the RTAB-Map processes. Empty uses the YAML value.'),
         arg(
             'lidar_only',
-            '',
-            'SLAM from the Mid-360 cloud and odometry. Empty uses the YAML value.',
+            'true',
+            'SLAM from the Mid-360 cloud and odometry. False also subscribes to the camera.',
+            ['true', 'false'],
         ),
         OpaqueFunction(function=launch_setup),
     ])

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Localize the G1 in an existing RTAB-Map database. The map is not updated.
 
+An empty database_path uses the newest *.db in <workspace>/map_bk.
+
     source ros2_source.sh
     ros2 launch g1_nav g1_localization.launch.py
 
@@ -8,6 +10,7 @@
         database_path:=/home/fcp/robot-nav/map_bk/g1_rtabmap_20261031_002906.db
 """
 
+import glob
 import os
 
 from launch import LaunchDescription
@@ -41,10 +44,18 @@ def _workspace_root():
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _latest_backup(workspace):
+    folder = os.path.join(workspace, 'map_bk')
+    candidates = [path for path in glob.glob(os.path.join(folder, '*.db')) if os.path.isfile(path)]
+    if not candidates:
+        raise RuntimeError(f'no database in {folder}')
+    return max(candidates, key=os.path.getmtime)
+
+
 def _launch(context, *args, **kwargs):
     database_path = LaunchConfiguration('database_path').perform(context).strip()
     if not database_path:
-        database_path = os.path.join(_workspace_root(), 'map', 'g1_rtabmap.db')
+        database_path = _latest_backup(_workspace_root())
     if not os.path.isfile(database_path):
         raise RuntimeError(f'localization database not found: {database_path}')
     params_file = LaunchConfiguration('params_file').perform(context).strip() or _default_params()
@@ -77,7 +88,7 @@ def generate_launch_description():
         arg(
             'database_path',
             '',
-            'Existing RTAB-Map database. Empty uses <workspace>/map/g1_rtabmap.db.',
+            'Existing RTAB-Map database. Empty uses the newest *.db in <workspace>/map_bk.',
         ),
         arg('use_sim_time', 'false', 'Use /clock when true.'),
         arg('params_file', '', 'YAML file. Empty uses config/g1_localization.yaml.'),

@@ -3,7 +3,8 @@
 #
 # /rtabmap/backup closes the live file and reloads it. On this database that
 # hits "database is locked" and aborts the process. This script pauses RTAB-Map,
-# copies the file with SQLite's backup API, saves /map, then resumes.
+# copies the file with SQLite's backup API, asks /rtabmap/get_map for the
+# occupancy grid, then resumes. /map itself is not published while paused.
 #
 #   ./utils/save_map.sh
 #   ./utils/save_map.sh /path/to/output_dir
@@ -15,8 +16,8 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MAP_DIR="${PROJECT_DIR}/map"
 DEST_DIR="${1:-${PROJECT_DIR}/map_bk}"
 DB_PATH="${DB_PATH:-${MAP_DIR}/g1_rtabmap.db}"
-MAP_TOPIC="${MAP_TOPIC:-/map}"
 RTABMAP_NODE="${RTABMAP_NODE:-/rtabmap}"
+GET_MAP_SVC="${RTABMAP_NODE}/get_map"
 PAUSE_SVC="${RTABMAP_NODE}/pause"
 RESUME_SVC="${RTABMAP_NODE}/resume"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -68,39 +69,31 @@ PY
 echo "saved ${DB_DEST}"
 
 MAP_STEM="${DEST_DIR}/map_${STAMP}"
-echo "Saving occupancy grid from ${MAP_TOPIC}"
-python3 - "${MAP_TOPIC}" "${MAP_STEM}" << 'PY'
+echo "Saving occupancy grid via ${GET_MAP_SVC}"
+python3 - "${GET_MAP_SVC}" "${MAP_STEM}" << 'PY'
 import math
 import sys
 
 import rclpy
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.srv import GetMap
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-topic, stem = sys.argv[1], sys.argv[2]
+service, stem = sys.argv[1], sys.argv[2]
 rclpy.init()
 node = Node("save_map_grid")
-holder = {"msg": None}
-
-def on_map(msg):
-    holder["msg"] = msg
-
-qos = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
-    history=HistoryPolicy.KEEP_LAST,
-    depth=1,
-)
-node.create_subscription(OccupancyGrid, topic, on_map, qos)
-end = node.get_clock().now().nanoseconds + 10 * 1_000_000_000
-while rclpy.ok() and holder["msg"] is None and node.get_clock().now().nanoseconds < end:
-    rclpy.spin_once(node, timeout_sec=0.2)
-msg = holder["msg"]
+client = node.create_client(GetMap, service)
+if not client.wait_for_service(timeout_sec=10.0):
+    node.destroy_node()
+    rclpy.shutdown()
+    raise SystemExit(f"{service} is not available")
+future = client.call_async(GetMap.Request())
+rclpy.spin_until_future_complete(node, future, timeout_sec=180.0)
+response = future.result()
 node.destroy_node()
 rclpy.shutdown()
-if msg is None:
-    raise SystemExit(f"no message on {topic}")
+if response is None or response.map.info.width == 0 or response.map.info.height == 0:
+    raise SystemExit(f"{service} returned an empty occupancy grid")
+msg = response.map
 
 width, height = msg.info.width, msg.info.height
 rows = []
