@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""G1 controller bridge: HTTP REST and the operator console.
+"""robot_bridge: G1 HTTP REST and the operator console.
 
-Same role as go2_controller_bridge. Stick and /cmd_vel holds call
-LocoClient.SetVelocity; sport and arm routes call the Unitree SDK2 clients.
+Stick and /cmd_vel holds call LocoClient.SetVelocity as soon as the previous
+call returns. Sport and arm routes call the Unitree SDK2 clients.
 Console: http://0.0.0.0:<port>/console/
 """
 
@@ -59,8 +59,9 @@ LINEAR_SCALE = 0.6
 YAW_SCALE = 1.0
 HTTP_CLIENT_SEC = 3.0
 HOLD_TIMEOUT_SEC = 0.45
-HOLD_PERIOD_SEC = 0.2
-VELOCITY_DURATION_SEC = 0.5
+# Each SetVelocity stays active this long. Short, so a stop is not delayed
+# by a command that is still timing out.
+VELOCITY_DURATION_SEC = 0.05
 ODOM_STALE_SEC = 1.0
 ODOM_SOURCES = (
     {"id": "pelvis", "name": "Pelvis", "topic": "rt/state_estimator/odom_pelvis", "kind": "nav"},
@@ -1084,7 +1085,7 @@ class ZmqInterface:
             poller.register(mon, zmq.POLLIN)
         while not self._stop.is_set():
             try:
-                ready = dict(poller.poll(200))
+                ready = dict(poller.poll(1))
             except Exception:
                 break
             if mon is not None and mon in ready:
@@ -1263,7 +1264,7 @@ class LocalJoystick:
 
     def _loop(self) -> None:
         last_sig = None
-        while not self._stop.wait(0.02):
+        while not self._stop.wait(0.005):
             with self._lock:
                 grab = self._grab
             if not grab:
@@ -1331,7 +1332,7 @@ class G1Controller:
         }
         self._moving = False
         self._gait = False
-        self._thread = threading.Thread(target=self._hold_loop, name="g1-drive", daemon=True)
+        self._thread = threading.Thread(target=self._hold_loop, name="robot-drive", daemon=True)
         self._fsm_lock = threading.Lock()
         self._fsm_state = {
             "up": False,
@@ -1624,10 +1625,9 @@ class G1Controller:
             self._gait = True
 
     def _hold_loop(self) -> None:
-        last_send = 0.0
         while not self._stop.is_set():
-            time.sleep(0.05)
             if not self.ready or self.client is None:
+                time.sleep(0.01)
                 continue
             hold = dict(self._hold)
             active = hold["mode"] != "idle" and (time.time() - hold["ts"]) <= HOLD_TIMEOUT_SEC
@@ -1635,9 +1635,7 @@ class G1Controller:
             if not active or not moving:
                 if self._moving:
                     self.stop_motion(source="hold")
-                continue
-            now = time.time()
-            if now - last_send < HOLD_PERIOD_SEC:
+                time.sleep(0.01)
                 continue
             with self._lock:
                 try:
@@ -1657,7 +1655,6 @@ class G1Controller:
                         self.last_error = ""
                         self._vel_fault = ""
                         self._moving = True
-                        last_send = now
                 except Exception as exc:
                     message = str(exc)
                     self.last_error = message
@@ -1666,6 +1663,8 @@ class G1Controller:
                         self.actions.record(
                             "drive", "SetVelocity", ok=False, detail=message, source="hold",
                         )
+            # Yield only. The next command goes out as soon as SetVelocity returns.
+            time.sleep(0.001)
 
     def sport(self, slug: str, body: dict | None = None) -> tuple[int, dict]:
         info = SPORT_ACTIONS.get(slug)
@@ -2621,7 +2620,7 @@ def build_app(robot: G1Controller):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="G1 controller REST bridge and console")
+    parser = argparse.ArgumentParser(description="robot_bridge: G1 REST bridge and console")
     parser.add_argument("--interface", default=os.environ.get("G1_DDS_INTERFACE", "auto"))
     parser.add_argument("--port", type=int, default=None)
     args = parser.parse_args()
@@ -2633,7 +2632,7 @@ def main() -> None:
     port = args.port if args.port is not None else int(saved["http"]["port"])
     robot.bind_host = host
     robot.bind_port = port
-    print(f"G1 controller DDS interface {iface}", flush=True)
+    print(f"robot_bridge DDS interface {iface}", flush=True)
     try:
         robot.start()
     except Exception as exc:

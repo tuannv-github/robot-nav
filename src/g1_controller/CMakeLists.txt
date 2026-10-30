@@ -4,7 +4,7 @@ project(g1_controller)
 find_package(ament_cmake REQUIRED)
 
 install(PROGRAMS
-  scripts/g1_controller_bridge.py
+  scripts/robot_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

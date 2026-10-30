@@ -1,0 +1,158 @@
+# G1 RTAB-Map parameters. Edit this file, then relaunch.
+#
+#   ros2 launch g1_nav g1_rtabmap.launch.py
+#
+# lidar_only, localization, database_path, and use_sim_time can still be
+# passed on the command line. Everything else is here.
+#
+# The launch sets these from lidar_only / enable_livox_cloud:
+#   Grid/Sensor, Reg/Strategy, subscribe_rgb, subscribe_depth, subscribe_rgbd,
+#   subscribe_scan_cloud, RGBD/NeighborLinkRefining
+
+odom_topic: /odom
+# robot-bridge publishes /odom and odom -> base_link from the torso estimator.
+# TF z is held at 0. odom_z_offset is unused.
+odom_z_offset: 0.110
+
+scan_cloud_topic: /livox/lidar
+lidar_only: true
+enable_livox_cloud: true
+
+rgb_topic: /input/camera/camera/color/image_raw
+rgb_info_topic: /input/camera/camera/color/camera_info
+depth_topic: /input/camera/camera/aligned_depth_to_color/image_raw
+
+# "all" uses every core. A list such as "0-4" pins the RTAB-Map processes.
+rtab_cpu_affinity: all
+
+# base_link: x forward, y left, z up. Angles in degrees.
+# Downward RealSense. Pitch -90 points +x down. Uncalibrated.
+camera:
+  x: 0.10
+  y: 0.0
+  z: 0.40
+  roll: 0.0
+  pitch: -90.0
+  yaw: 0.0
+
+# Mid-360 is mounted upside down: roll 180 turns sensor +Z up in base_link.
+# lidar.z puts the floor at z=0 in base_link.
+lidar:
+  x: 0.0
+  y: 0.0
+  z: 1.1
+  roll: 180.0
+  pitch: 0.0
+  yaw: 0.0
+
+# Passed to the rtabmap node. Quoted values stay strings, which RTAB-Map parses.
+rtab:
+  frame_id: base_link
+  guess_frame_id: odom
+  odom_frame_id: odom
+  Reg/Force3DoF: "true"
+  approx_sync: true
+  sync_queue_size: 30
+  topic_queue_size: 30
+  use_action_for_goal: true
+  wait_imu_to_init: false
+  wait_for_transform: 0.5
+  Grid/DepthDecimation: "1"
+  # Mid-360 spec is 40 m at 10% reflectivity. Keep hits only to 5 m.
+  Grid/RangeMax: "5"
+  # 2 cm cells. Ray tracing fills the 2D floor.
+  Grid/CellSize: "0.02"
+  Grid/RayTracing: "true"
+  # 0.35 clears an obstacle after about 2 misses. 0.42 needs about 4.
+  # 0.45 left old marks and smeared.
+  GridGlobal/ProbMiss: "0.42"
+  GridGlobal/ProbHit: "0.80"
+  GridGlobal/OccupancyThr: "0.55"
+  GridGlobal/MinSize: "20"
+  Grid/MinClusterSize: "20"
+  # Map-frame z, metres. Floor is -0.20 to 0.15. 0.15 to 1.80 is obstacle. Above 1.80 is dropped.
+  Grid/3D: "false"
+  Grid/MapFrameProjection: "true"
+  Grid/NormalsSegmentation: "false"
+  Grid/MinGroundHeight: "-0.20"
+  Grid/MaxGroundHeight: "0.15"
+  Grid/MaxObstacleHeight: "1.80"
+  Grid/RangeMin: "0.1"
+  Grid/FootprintLength: "0.35"
+  Grid/FootprintWidth: "0.45"
+  Grid/FootprintHeight: "1.25"
+  Odom/ResetCountdown: "2"
+  Kp/RoiRatios: "0.0 0.0 0.0 0.0"
+  scan_cloud_is_2d: false
+  # robot-bridge publishes /livox/lidar as RELIABLE. qos 0 is best effort and drops it.
+  qos_scan: 1
+  subscribe_odom_info: false
+  # 2 Hz. Faster matching was still running when the robot had already moved, so the correction fought odom.
+  Rtabmap/DetectionRate: "2"
+  Rtabmap/TimeThr: "0"
+  Rtabmap/MemoryThr: "0"
+  # Visual loop threshold. Lidar-only loops use proximity detection below, not this.
+  Rtabmap/LoopThr: "0.11"
+  # Default 2. Pulling dozens of old nodes back lets a wrong room win.
+  Rtabmap/MaxRetrieved: "2"
+  # Reject a loop whose error is large compared with its covariance.
+  RGBD/OptimizeMaxError: "1.0"
+  # Default is 20 iterations, stopping at an error improvement of 1e-5.
+  Optimizer/Iterations: "100"
+  Optimizer/Epsilon: "0.000001"
+  # A node every 5 cm so each ICP step stays inside the 10 cm gate.
+  RGBD/LinearUpdate: "0.05"
+  RGBD/AngularUpdate: "0.05"
+  # Eight nearby paths, inside 12 m and 50 links. Matching every old path
+  # pulled the new pose back onto the previous wall and ignored the odom step.
+  # Angle 180 lets a reversed turn match the same walls.
+  RGBD/ProximityBySpace: "true"
+  RGBD/ProximityByTime: "false"
+  RGBD/ProximityOdomGuess: "true"
+  RGBD/LocalRadius: "12"
+  RGBD/ProximityMaxGraphDepth: "50"
+  RGBD/ProximityPathFilteringRadius: "1.0"
+  RGBD/ProximityMaxPaths: "8"
+  RGBD/ProximityPathMaxNeighbors: "1"
+  RGBD/ProximityAngle: "180"
+  # Lidar-only nodes have no image. true makes RTAB-Map uncompress a camera frame on every match.
+  RGBD/LoopClosureReextractFeatures: "false"
+  # Second ICP pass on a loop, started from the first result. Default true.
+  Reg/RepeatOnce: "true"
+  Kp/MaxFeatures: "1000"
+  Kp/NndrRatio: "0.8"
+  GFTT/MinDistance: "3"
+  Vis/MaxFeatures: "1000"
+  Vis/MinInliers: "20"
+  Vis/CorNNDR: "0.8"
+  Vis/CorGuessWinSize: "0"
+  # Paper accuracy setup: keep 30 recent nodes, and keep more distinct places.
+  Mem/STMSize: "40"
+  Mem/RehearsalSimilarity: "0.2"
+  # Tight point-to-plane ICP. A 1 m correspondence distance lets a corner
+  # point attach to the wrong wall, and a 3 m translation limit keeps that error.
+  # Normals use a 3 cm radius so the two faces of a corner stay separate.
+  # K must be 0 when a radius is set; PCL rejects both and RTAB-Map aborts.
+  Icp/PointToPlane: "true"
+  Icp/PointToPlaneK: "0"
+  Icp/PointToPlaneRadius: "0.03"
+  Icp/PointToPlaneGroundNormalsUp: "0.8"
+  Icp/DownsamplingStep: "1"
+  Icp/ReciprocalCorrespondences: "true"
+  Icp/OutlierRatio: "0.70"
+  # A floor-heavy Mid-360 scan is low complexity. Strategy 3 kept a pose with
+  # zero correspondences, so the link was dropped and the map followed odom.
+  # Strategy 1 recomputes point-to-point and limits the weak axes.
+  Icp/PointToPlaneMinComplexity: "0.02"
+  Icp/PointToPlaneLowComplexityStrategy: "1"
+  # 10 cm correspondence and 20 cm translation. A 25 cm search let a point
+  # lock onto the neighboring wall and smear it. A 1 m gate does the same.
+  Icp/Iterations: "100"
+  Icp/Epsilon: "0.0005"
+  Icp/CorrespondenceRatio: "0.5"
+  Icp/RangeMin: "0.1"
+  Icp/RangeMax: "5"
+  Icp/MaxCorrespondenceDistance: "0.10"
+  Icp/MaxTranslation: "0.20"
+  Icp/MaxRotation: "0.80"
+  Icp/VoxelSize: "0.015"

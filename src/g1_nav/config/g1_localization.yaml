@@ -1,0 +1,140 @@
+# G1 localization parameters. The map is not updated.
+#
+#   ros2 launch g1_nav g1_localization.launch.py
+#
+# Mapping uses config/g1_rtabmap.yaml. Edit this file to change localization
+# only. The launch forces Mem/IncrementalMemory false and loads every saved node.
+
+odom_topic: /odom
+# robot-bridge publishes /odom and odom -> base_link from the torso estimator.
+# TF z is held at 0. odom_z_offset is unused.
+odom_z_offset: 0.110
+
+scan_cloud_topic: /livox/lidar
+lidar_only: true
+enable_livox_cloud: true
+
+rgb_topic: /input/camera/camera/color/image_raw
+rgb_info_topic: /input/camera/camera/color/camera_info
+depth_topic: /input/camera/camera/aligned_depth_to_color/image_raw
+
+# "all" uses every core. A list such as "0-4" pins the RTAB-Map processes.
+rtab_cpu_affinity: all
+
+# base_link: x forward, y left, z up. Angles in degrees.
+# Downward RealSense. Pitch -90 points +x down. Uncalibrated.
+camera:
+  x: 0.10
+  y: 0.0
+  z: 0.40
+  roll: 0.0
+  pitch: -90.0
+  yaw: 0.0
+
+# Mid-360 is mounted upside down: roll 180 turns sensor +Z up in base_link.
+# Keep this identical to the mapping file. The saved map was built with it.
+lidar:
+  x: 0.0
+  y: 0.0
+  z: 1.1
+  roll: 180.0
+  pitch: 0.0
+  yaw: 0.0
+
+# Passed to the rtabmap node. Quoted values stay strings, which RTAB-Map parses.
+rtab:
+  frame_id: base_link
+  guess_frame_id: odom
+  odom_frame_id: odom
+  Reg/Force3DoF: "true"
+  approx_sync: true
+  sync_queue_size: 30
+  topic_queue_size: 30
+  use_action_for_goal: true
+  wait_imu_to_init: false
+  wait_for_transform: 0.5
+  Grid/DepthDecimation: "1"
+  # Mid-360 spec: 40 m at 10% reflectivity.
+  Grid/RangeMax: "40"
+  Grid/CellSize: "0.02"
+  # The occupancy grid is already in the database. Ray tracing it again smears the loaded map.
+  Grid/RayTracing: "false"
+  GridGlobal/ProbMiss: "0.42"
+  GridGlobal/ProbHit: "0.80"
+  GridGlobal/OccupancyThr: "0.55"
+  GridGlobal/MinSize: "20"
+  Grid/MinClusterSize: "20"
+  Grid/3D: "false"
+  Grid/MapFrameProjection: "true"
+  Grid/NormalsSegmentation: "false"
+  Grid/MinGroundHeight: "-0.20"
+  Grid/MaxGroundHeight: "0.15"
+  Grid/MaxObstacleHeight: "1.80"
+  Grid/RangeMin: "0.1"
+  Grid/FootprintLength: "0.35"
+  Grid/FootprintWidth: "0.45"
+  Grid/FootprintHeight: "1.25"
+  Odom/ResetCountdown: "2"
+  Kp/RoiRatios: "0.0 0.0 0.0 0.0"
+  scan_cloud_is_2d: false
+  # robot-bridge publishes /livox/lidar as RELIABLE. qos 0 is best effort and drops it.
+  qos_scan: 1
+  subscribe_odom_info: false
+  # Same rate as the Go2 localization launch. A wider match is slower than 2 Hz.
+  Rtabmap/DetectionRate: "1"
+  Rtabmap/TimeThr: "0"
+  Rtabmap/MemoryThr: "0"
+  Rtabmap/LoopThr: "0.11"
+  Rtabmap/MaxRetrieved: "2"
+  # Go2 localization disables this. A real correction looks huge against the odom covariance.
+  RGBD/OptimizeMaxError: "0"
+  # One localization link. The mapping file uses 100 iterations for the whole graph.
+  Optimizer/Iterations: "20"
+  Optimizer/Epsilon: "0.00001"
+  RGBD/LinearUpdate: "0.05"
+  RGBD/AngularUpdate: "0.05"
+  # The database still has a localization from an older odom origin. Using it
+  # jumped the robot 34 m and the scan no longer met the map.
+  RGBD/StartAtOrigin: "true"
+  # Search the whole saved map. Mapping limits this to 8 paths and 50 links
+  # so a new scan cannot lock onto an old wall.
+  RGBD/ProximityBySpace: "true"
+  RGBD/ProximityByTime: "false"
+  RGBD/ProximityOdomGuess: "true"
+  RGBD/LocalRadius: "15"
+  RGBD/ProximityMaxGraphDepth: "0"
+  # Go2 localization searches 10 m around the guess. 1 m left the scan short of the map.
+  RGBD/ProximityPathFilteringRadius: "10.0"
+  RGBD/ProximityMaxPaths: "8"
+  RGBD/ProximityPathMaxNeighbors: "5"
+  RGBD/MaxLocalRetrieved: "8"
+  RGBD/MaxOdomCacheSize: "3"
+  RGBD/ProximityAngle: "180"
+  RGBD/LoopClosureReextractFeatures: "false"
+  Reg/RepeatOnce: "true"
+  Kp/MaxFeatures: "1000"
+  Kp/NndrRatio: "0.8"
+  GFTT/MinDistance: "3"
+  Vis/MaxFeatures: "1000"
+  Vis/MinInliers: "20"
+  Vis/CorNNDR: "0.8"
+  Vis/CorGuessWinSize: "0"
+  Mem/STMSize: "40"
+  Mem/RehearsalSimilarity: "0.2"
+  # Same ICP window as go2_rtabmap.livox.location.launch.py. A 15 cm
+  # search found no correspondences when the scan was not already on the wall.
+  Icp/Iterations: "30"
+  Icp/MaxCorrespondenceDistance: "10.0"
+  Icp/MaxTranslation: "10.0"
+  Icp/MaxRotation: "3.1416"
+  Icp/VoxelSize: "0.12"
+  Icp/RangeMin: "0.5"
+  Icp/RangeMax: "40"
+  # The database stores 0.5. Left unset, that value is loaded and proximity
+  # detection then requires the whole scan to overlap the map (2 x ratio).
+  # 0.1 accepts a 20% overlap, which a 40 m scan can have against the 5 m map.
+  Icp/CorrespondenceRatio: "0.1"
+  # The lidar cloud has no normals, and the node forces the normal radius to 0.
+  # The database was supplying K=0, so point-to-plane had no neighbors.
+  Icp/PointToPlaneK: "20"
+  Icp/PointToPlaneRadius: "0"

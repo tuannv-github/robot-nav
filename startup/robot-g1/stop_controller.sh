@@ -19,7 +19,7 @@ for arg in "$@"; do
   prev="${arg}"
 done
 
-PATTERN="g1_controller_bridge.py|ros2 launch g1_controller"
+PATTERN="robot_bridge.py|g1_controller_bridge.py|ros2 launch g1_controller"
 
 controller_pids() {
   local pid

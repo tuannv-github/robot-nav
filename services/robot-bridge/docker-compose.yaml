@@ -19,13 +19,25 @@ services:
       CMD_VEL_TOPIC: ${CMD_VEL_TOPIC:-/cmd_vel}
       LIDAR_TOPIC: ${LIDAR_TOPIC:-/livox/lidar}
       LIDAR_FRAME: ${LIDAR_FRAME:-livox_frame}
-      LIDAR_FRAME_SEC: ${LIDAR_FRAME_SEC:-0.1}
+      LIDAR_FRAME_SEC: ${LIDAR_FRAME_SEC:-0.05}
+      LIDAR_DESKEW: ${LIDAR_DESKEW:-false}
+      LIDAR_X: ${LIDAR_X:-0.0}
+      LIDAR_Y: ${LIDAR_Y:-0.0}
+      LIDAR_Z: ${LIDAR_Z:-1.1}
+      LIDAR_ROLL: ${LIDAR_ROLL:-180}
+      LIDAR_PITCH: ${LIDAR_PITCH:-0}
+      LIDAR_YAW: ${LIDAR_YAW:-0}
       ODOM_FRAME: ${ODOM_FRAME:-odom}
+      ODOM_FORWARD: ${ODOM_FORWARD:-true}
+      PUBLISH_ODOM_TF: ${PUBLISH_ODOM_TF:-true}
+      ODOM_ZERO_START: ${ODOM_ZERO_START:-true}
+      ODOM_FIXED_Z: ${ODOM_FIXED_Z:-true}
       IDLE_TIMEOUT_SEC: ${IDLE_TIMEOUT_SEC:-0.5}
       STICK_LINEAR_SCALE: ${STICK_LINEAR_SCALE:-0.6}
       STICK_YAW_SCALE: ${STICK_YAW_SCALE:-1.0}
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /app/fastdds.xml
       DDS_INTERFACE: ${DDS_INTERFACE:-ens12f0}
       DDS_PEERS: ${DDS_PEERS:-10.1.100.220}
     restart: unless-stopped

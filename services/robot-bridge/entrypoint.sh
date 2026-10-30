@@ -9,6 +9,7 @@ set -u
 
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
+export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-/app/fastdds.xml}"
 
 if [[ "${RMW_IMPLEMENTATION}" == *cyclonedds* && -z "${CYCLONEDDS_URI:-}" ]]; then
   iface="${DDS_INTERFACE:-ens12f0}"

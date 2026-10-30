@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bridge ZMQ lidar, odometry, and control onto ROS 2.
 
-  tcp://127.0.0.1:5600  [lidar, packet] / [odom, json]  -> /livox/lidar, /odom/*
+  tcp://127.0.0.1:5600  [lidar, packet] / [odom, json]  -> /livox/lidar, /odom/*, /tf
   tcp://127.0.0.1:5603  {type: cmd_vel|stick|stop}      -> /cmd_vel
 
 Payloads match the G1 control hub:
@@ -23,16 +23,18 @@ import math
 import os
 import struct
 import time
+from collections import deque
 
 import numpy as np
 import rclpy
 import zmq
-from geometry_msgs.msg import Quaternion, Twist
+from geometry_msgs.msg import Quaternion, TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, PointField
+from tf2_ros import TransformBroadcaster
 
-# Match g1_controller_bridge LINEAR_SCALE / YAW_SCALE.
+# Match robot_bridge LINEAR_SCALE / YAW_SCALE.
 DEFAULT_LINEAR_SCALE = 0.6
 DEFAULT_YAW_SCALE = 1.0
 
@@ -53,6 +55,42 @@ _POINT_LOW = np.dtype([
     ("tag", "u1"),
 ])
 _ODOM_SOURCES = ("odom", "pelvis", "torso", "fusion", "fusion-torso")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
+def _quat_mul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def _rotate(q, v):
+    x, y, z, w = q
+    vx, vy, vz = v
+    ix = w * vx + y * vz - z * vy
+    iy = w * vy + z * vx - x * vz
+    iz = w * vz + x * vy - y * vx
+    iw = -x * vx - y * vy - z * vz
+    return (
+        iw * -x + ix * w + iy * -z - iz * -y,
+        iw * -y + iy * w + iz * -x - ix * -z,
+        iw * -z + iz * w + ix * -y - iy * -x,
+    )
 
 
 def _env_float(name: str, default: float) -> float:
@@ -100,14 +138,19 @@ def velocity_from_control(body: dict, linear_scale: float, yaw_scale: float) -> 
 
 
 def odom_ros_topic(source_id: str) -> str:
-    if source_id == "odom":
+    # Torso estimator is the mapping odom. Sport mode stays on its own topic.
+    if source_id == "torso":
         return "/odom"
+    if source_id == "odom":
+        return "/odom/sport"
     return "/odom/" + source_id.replace("-", "_")
 
 
 def odom_child_frame(source_id: str) -> str:
-    if source_id in ("odom", "fusion"):
+    if source_id in ("torso", "fusion"):
         return "base_link"
+    if source_id == "odom":
+        return "sport"
     if source_id == "fusion-torso":
         return "torso"
     return source_id.replace("-", "_")
@@ -130,6 +173,116 @@ def _quat(roll: float, pitch: float, yaw: float) -> Quaternion:
     quat.y = cr * sp * cy + sr * cp * sy
     quat.z = cr * cp * sy - sr * sp * cy
     return quat
+
+
+def _rpy_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """ROS rpy: R = Rz(yaw) Ry(pitch) Rx(roll). Maps a sensor point into base_link."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]], dtype=np.float64)
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]], dtype=np.float64)
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    return rz @ ry @ rx
+
+
+def _quat_matrix(quat) -> np.ndarray:
+    x, y, z, w = quat
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return np.array(
+        [
+            [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _slerp(a, b, u: float):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    dot = float(np.dot(a, b))
+    if dot < 0.0:
+        b = -b
+        dot = -dot
+    if dot > 0.9995:
+        out = a + u * (b - a)
+        return out / np.linalg.norm(out)
+    theta = math.acos(max(-1.0, min(1.0, dot)))
+    scale = math.sin(theta)
+    return (math.sin((1.0 - u) * theta) * a + math.sin(u * theta) * b) / scale
+
+
+def _yaw_of(quat) -> float:
+    x, y, z, w = quat
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _blend_pose(a, b, u: float):
+    xyz = tuple((1.0 - u) * a[i] + u * b[i] for i in range(3))
+    quat = tuple(float(v) for v in _slerp(a[3:7], b[3:7], u))
+    return xyz + quat
+
+
+def _advance_pose(pose, twist, dt: float):
+    """Step a pose by a body-frame twist. dt may be negative."""
+    if abs(dt) < 1e-6:
+        return pose[:7]
+    rotation = _quat_matrix(pose[3:7])
+    velocity = rotation @ np.asarray(twist[:3], dtype=np.float64)
+    xyz = tuple(float(pose[i] + velocity[i] * dt) for i in range(3))
+    quat = pose[3:7]
+    spin = _quat_mul(quat, (twist[3], twist[4], twist[5], 0.0))
+    updated = tuple(quat[i] + 0.5 * dt * spin[i] for i in range(4))
+    norm = math.sqrt(sum(value * value for value in updated)) or 1.0
+    return xyz + tuple(value / norm for value in updated)
+
+
+def interp_pose(samples, when: float):
+    """Pose (x, y, z, qx, qy, qz, qw) at `when`.
+
+    Samples are (time, x, y, z, qx, qy, qz, qw, vx, vy, vz, wx, wy, wz).
+    Twist is body frame. Outside the samples the nearest twist is integrated,
+    so a cloud newer than the last odom still moves.
+    """
+    if not samples:
+        return None
+    if when <= samples[0][0]:
+        dt = when - samples[0][0]
+        if dt < -0.15:
+            return None
+        return _advance_pose(samples[0][1:8], samples[0][8:14], dt)
+    if when >= samples[-1][0]:
+        dt = when - samples[-1][0]
+        if dt > 0.15:
+            return None
+        return _advance_pose(samples[-1][1:8], samples[-1][8:14], dt)
+    for index in range(1, len(samples)):
+        if samples[index][0] < when:
+            continue
+        t0 = samples[index - 1][0]
+        t1 = samples[index][0]
+        span = t1 - t0
+        blend = 0.0 if span <= 0.0 else (when - t0) / span
+        return _blend_pose(samples[index - 1][1:8], samples[index][1:8], blend)
+    return None
+
+
+def deskew_points(pts: np.ndarray, pose_from, pose_to, rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    """Move sensor points from pose_from into the sensor frame of pose_to."""
+    if pose_from is None or pose_to is None:
+        return pts
+    xyz = pts[:, :3].astype(np.float64, copy=False)
+    base = xyz @ rotation.T + translation
+    world = base @ _quat_matrix(pose_from[3:]).T + np.asarray(pose_from[:3], dtype=np.float64)
+    back = (world - np.asarray(pose_to[:3], dtype=np.float64)) @ _quat_matrix(pose_to[3:])
+    sensor = (back - translation) @ rotation
+    out = pts.copy()
+    out[:, :3] = sensor.astype(np.float32)
+    return out
 
 
 def points_from_packet(raw: bytes) -> np.ndarray | None:
@@ -191,7 +344,34 @@ class ZmqControlBridge(Node):
         lidar_topic = os.environ.get("LIDAR_TOPIC", "/livox/lidar").strip() or "/livox/lidar"
         self._lidar_frame = os.environ.get("LIDAR_FRAME", "livox_frame").strip() or "livox_frame"
         self._odom_frame = os.environ.get("ODOM_FRAME", "odom").strip() or "odom"
+        # Torso estimator owns /odom and odom -> base_link.
+        self._odom_forward = _env_bool("ODOM_FORWARD", True)
+        self._publish_tf = _env_bool("PUBLISH_ODOM_TF", True) and self._odom_forward
+        # Torso /odom is an absolute pose. The first sample is the TF origin.
+        # The /odom message itself stays absolute.
+        self._zero_start = _env_bool("ODOM_ZERO_START", True)
+        # Estimator z is a datum (several metres) and drifts. Hold TF z at 0.
+        self._fixed_z = _env_bool("ODOM_FIXED_Z", True)
+        self._odom_origin = None
         self._lidar_period = _env_float("LIDAR_FRAME_SEC", 0.1)
+        self._deskew = _env_bool("LIDAR_DESKEW", True)
+        mount_rpy = (
+            math.radians(_env_float("LIDAR_ROLL", 180.0)),
+            math.radians(_env_float("LIDAR_PITCH", 0.0)),
+            math.radians(_env_float("LIDAR_YAW", 0.0)),
+        )
+        self._mount_R = _rpy_matrix(*mount_rpy)
+        self._mount_t = np.array(
+            [
+                _env_float("LIDAR_X", 0.0),
+                _env_float("LIDAR_Y", 0.0),
+                _env_float("LIDAR_Z", 1.1),
+            ],
+            dtype=np.float64,
+        )
+        self._poses: deque = deque(maxlen=200)
+        self._deskew_dxy = 0.0
+        self._deskew_dyaw = 0.0
         self.declare_parameter("lidar_endpoint", lidar_ep)
         self.declare_parameter("lidar_topic", lidar_topic)
 
@@ -200,8 +380,9 @@ class ZmqControlBridge(Node):
         self._odom_pubs = {
             source_id: self.create_publisher(Odometry, odom_ros_topic(source_id), 10)
             for source_id in _ODOM_SOURCES
-        }
-        self._lidar_chunks: list[np.ndarray] = []
+        } if self._odom_forward else {}
+        self._tf = TransformBroadcaster(self) if self._publish_tf else None
+        self._lidar_chunks: list[tuple[float, np.ndarray]] = []
         self._lidar_window = time.monotonic()
         self._lidar_pkts = 0
         self._lidar_pts = 0
@@ -236,9 +417,20 @@ class ZmqControlBridge(Node):
         )
         self.get_logger().info(
             f"ZMQ {lidar_endpoint or 'off'} -> {lidar_topic} ({self._lidar_frame}, "
-            f"{self._lidar_period:.2f}s) and /odom, /odom/pelvis, /odom/torso, "
-            f"/odom/fusion, /odom/fusion_torso"
+            f"{self._lidar_period:.2f}s, deskew={'on' if self._deskew else 'off'})"
+            + (
+                ""
+                if not self._odom_forward
+                else " and /odom (torso), /odom/pelvis, /odom/sport, /odom/fusion, /odom/fusion_torso"
+            )
         )
+        if not self._odom_forward:
+            self.get_logger().info("odom forward off; lidar scan owns odometry")
+        elif self._tf is not None:
+            self.get_logger().info(
+            f"TF {self._odom_frame} -> base_link, torso, base_footprint from the torso estimator; "
+            f"{self._odom_frame} -> pelvis  zero_start={self._zero_start} fixed_z={self._fixed_z}"
+            )
 
     def _poll(self) -> None:
         now = self._now()
@@ -253,6 +445,7 @@ class ZmqControlBridge(Node):
             self._on_frame(parts[-1] if parts else b"")
             now = self._now()
         if self._lidar_sub is not None:
+            lidar_batch = []
             while True:
                 try:
                     parts = self._lidar_sub.recv_multipart(flags=zmq.NOBLOCK)
@@ -261,7 +454,12 @@ class ZmqControlBridge(Node):
                 except zmq.ZMQError as exc:
                     self.get_logger().error(f"zmq lidar recv failed: {exc}")
                     break
-                self._on_sensor(parts)
+                if len(parts) >= 2 and parts[0] == b"odom":
+                    self._on_odom(parts[-1])
+                    continue
+                lidar_batch.append(parts[-1] if parts else b"")
+            if lidar_batch:
+                self._buffer_lidar(lidar_batch, time.time())
         self._flush_lidar()
         self._log_rates()
         if self._held and self._idle > 0.0 and (now - self._last_mono) >= self._idle:
@@ -276,20 +474,37 @@ class ZmqControlBridge(Node):
         sock.connect(endpoint)
         return sock
 
-    def _on_sensor(self, parts: list[bytes]) -> None:
-        if len(parts) >= 2 and parts[0] in (b"lidar", b"odom"):
-            topic, raw = parts[0], parts[-1]
-        else:
-            topic, raw = b"lidar", parts[-1] if parts else b""
-        if topic == b"odom":
-            self._on_odom(raw)
+    def _buffer_lidar(self, batch: list[bytes], host_now: float) -> None:
+        parsed = []
+        for raw in batch:
+            cloud = points_from_packet(raw)
+            if cloud is None:
+                continue
+            stamp_ns = struct.unpack_from("<Q", raw, 28)[0] if len(raw) >= 36 else 0
+            parsed.append((cloud, stamp_ns))
+            self._lidar_pkts += 1
+            self._lidar_pts += int(cloud.shape[0])
+        if not parsed:
             return
-        cloud = points_from_packet(raw)
-        if cloud is None:
-            return
-        self._lidar_chunks.append(cloud)
-        self._lidar_pkts += 1
-        self._lidar_pts += int(cloud.shape[0])
+        # time_type is unsynced, so the packet clock only orders points inside the burst.
+        newest = max((stamp for _, stamp in parsed if stamp > 0), default=0)
+        for cloud, stamp in parsed:
+            if newest > 0 and stamp > 0 and 0 <= newest - stamp < 2_000_000_000:
+                when = host_now - (newest - stamp) * 1e-9
+            else:
+                when = host_now
+            self._lidar_chunks.append((when, cloud))
+
+    def _note_base_pose(self, when: float, xyz, quat, twist) -> None:
+        self._poses.append((
+            when,
+            xyz[0], xyz[1], xyz[2],
+            quat[0], quat[1], quat[2], quat[3],
+            twist[0], twist[1], twist[2], twist[3], twist[4], twist[5],
+        ))
+        cutoff = when - 2.0
+        while len(self._poses) > 2 and self._poses[0][0] < cutoff:
+            self._poses.popleft()
 
     def _flush_lidar(self) -> None:
         if not self._lidar_chunks:
@@ -297,9 +512,23 @@ class ZmqControlBridge(Node):
         now = time.monotonic()
         if now - self._lidar_window < self._lidar_period:
             return
-        block = np.concatenate(self._lidar_chunks, axis=0)
-        self._lidar_chunks.clear()
+        chunks = self._lidar_chunks
+        self._lidar_chunks = []
         self._lidar_window = now
+        t_ref = chunks[-1][0]
+        pose_ref = interp_pose(self._poses, t_ref) if self._deskew else None
+        pose_old = interp_pose(self._poses, chunks[0][0]) if pose_ref is not None else None
+        if pose_ref is not None and pose_old is not None:
+            self._deskew_dxy = math.hypot(pose_ref[0] - pose_old[0], pose_ref[1] - pose_old[1])
+            self._deskew_dyaw = _yaw_of(pose_ref[3:]) - _yaw_of(pose_old[3:])
+        blocks = []
+        for when, cloud in chunks:
+            if pose_ref is None:
+                blocks.append(cloud)
+                continue
+            pose = interp_pose(self._poses, when)
+            blocks.append(deskew_points(cloud, pose, pose_ref, self._mount_R, self._mount_t))
+        block = np.concatenate(blocks, axis=0)
         msg = PointCloud2()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self._lidar_frame
@@ -322,6 +551,8 @@ class ZmqControlBridge(Node):
             self.get_logger().info(f"lidar {msg.width} points  frame {self._lidar_frame}")
 
     def _on_odom(self, raw: bytes) -> None:
+        if not self._odom_forward:
+            return
         try:
             body = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -365,7 +596,92 @@ class ZmqControlBridge(Node):
         msg.twist.twist.angular.y = wy
         msg.twist.twist.angular.z = wz
         pub.publish(msg)
+        self._publish_odom_tf(source_id, msg)
         self._odom_n += 1
+
+    def _publish_odom_tf(self, source_id: str, msg: Odometry) -> None:
+        # Torso owns the origin and is published as base_link and torso.
+        # Pelvis uses that same origin. Sport and fusion stay off /tf.
+        if self._tf is None or source_id not in ("torso", "pelvis"):
+            return
+        pose = msg.pose.pose
+        xyz = (pose.position.x, pose.position.y, pose.position.z)
+        quat = (
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        )
+        if self._zero_start:
+            if self._odom_origin is None:
+                if source_id != "torso":
+                    return
+                xyz, quat = self._relative_odom(xyz, quat)
+            else:
+                xyz, quat = self._apply_origin(xyz, quat)
+        if self._fixed_z and source_id == "torso":
+            xyz = (xyz[0], xyz[1], 0.0)
+        children = ("base_link", "torso") if source_id == "torso" else ("pelvis",)
+        stamped = []
+        for child in children:
+            transform = TransformStamped()
+            transform.header = msg.header
+            transform.child_frame_id = child
+            transform.transform.translation.x = xyz[0]
+            transform.transform.translation.y = xyz[1]
+            transform.transform.translation.z = xyz[2]
+            transform.transform.rotation.x = quat[0]
+            transform.transform.rotation.y = quat[1]
+            transform.transform.rotation.z = quat[2]
+            transform.transform.rotation.w = quat[3]
+            stamped.append(transform)
+        if source_id == "torso":
+            twist = msg.twist.twist
+            self._note_base_pose(time.time(), xyz, quat, (
+                twist.linear.x, twist.linear.y, twist.linear.z,
+                twist.angular.x, twist.angular.y, twist.angular.z,
+            ))
+            stamped.append(self._footprint_tf(msg.header, xyz, quat))
+        self._tf.sendTransform(stamped)
+
+    def _footprint_tf(self, header, xyz, quat) -> TransformStamped:
+        """base_link projected onto z=0: same x, y, and yaw, with roll and pitch cleared."""
+        yaw = math.atan2(
+            2.0 * (quat[3] * quat[2] + quat[0] * quat[1]),
+            1.0 - 2.0 * (quat[1] * quat[1] + quat[2] * quat[2]),
+        )
+        half = 0.5 * yaw
+        out = TransformStamped()
+        out.header = header
+        out.child_frame_id = "base_footprint"
+        out.transform.translation.x = xyz[0]
+        out.transform.translation.y = xyz[1]
+        out.transform.translation.z = 0.0
+        out.transform.rotation.z = math.sin(half)
+        out.transform.rotation.w = math.cos(half)
+        return out
+
+    def _relative_odom(self, position, quat):
+        if self._odom_origin is None:
+            ox, oy, oz = position
+            qx, qy, qz, qw = quat
+            self._odom_origin = (
+                _rotate((-qx, -qy, -qz, qw), (-ox, -oy, -oz)),
+                (-qx, -qy, -qz, qw),
+            )
+            self.get_logger().info(
+                f"odom TF origin captured x={ox:.3f} y={oy:.3f} z={oz:.3f}"
+            )
+        return self._apply_origin(position, quat)
+
+    def _apply_origin(self, position, quat):
+        origin_t, origin_q = self._odom_origin
+        rotated = _rotate(origin_q, position)
+        return (
+            origin_t[0] + rotated[0],
+            origin_t[1] + rotated[1],
+            origin_t[2] + rotated[2],
+        ), _quat_mul(origin_q, quat)
 
     def _log_rates(self) -> None:
         now = time.monotonic()
@@ -373,11 +689,13 @@ class ZmqControlBridge(Node):
         if elapsed < 5.0:
             return
         self.get_logger().info(
-            "lidar %d pkt/s  %d pt/s | odom %d msg/s"
+            "lidar %d pkt/s  %d pt/s | odom %d msg/s | deskew shift %.1f cm  %.2f deg"
             % (
                 round(self._lidar_pkts / elapsed),
                 round(self._lidar_pts / elapsed),
                 round(self._odom_n / elapsed),
+                self._deskew_dxy * 100.0,
+                math.degrees(self._deskew_dyaw),
             )
         )
         self._lidar_pkts = 0

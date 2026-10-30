@@ -8,14 +8,14 @@
 # Starting again stops the controller already running (bridge process and port).
 #
 # After colcon build, this uses `ros2 launch g1_controller` when install/ exists.
-# Otherwise it runs src/g1_controller/scripts/g1_controller_bridge.py directly.
+# Otherwise it runs src/g1_controller/scripts/robot_bridge.py directly.
 # Do not use `set -u`: colcon install/setup.bash reads unset variables.
 
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-BRIDGE="${PROJECT_DIR}/src/g1_controller/scripts/g1_controller_bridge.py"
+BRIDGE="${PROJECT_DIR}/src/g1_controller/scripts/robot_bridge.py"
 CONSOLE_DIR="${PROJECT_DIR}/src/g1_controller/console/web"
 SDK_DIR="${G1_SDK_DIR:-${PROJECT_DIR}/../3thrdparties/unitree_sdk2_python}"
 VIDEO_SRC="${PROJECT_DIR}/services/video-src/stream_g1_front.py"
@@ -93,7 +93,7 @@ stop_existing_controller() {
   local pid killed=0
   local -a pids=()
 
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
+  mapfile -t pids < <(pgrep -f "robot_bridge.py|g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     if kill -0 "${pid}" 2>/dev/null; then
@@ -112,7 +112,7 @@ stop_existing_controller() {
   local i
   for i in $(seq 1 25); do
     local still=0
-    mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
+    mapfile -t pids < <(pgrep -f "robot_bridge.py|g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
     for pid in "${pids[@]}"; do
       [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
       if kill -0 "${pid}" 2>/dev/null; then
@@ -126,7 +126,7 @@ stop_existing_controller() {
   done
 
   echo "Existing G1 controller did not exit; sending SIGKILL..."
-  mapfile -t pids < <(pgrep -f "g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
+  mapfile -t pids < <(pgrep -f "robot_bridge.py|g1_controller_bridge.py|ros2 launch g1_controller|stream_g1_front.py|stream_g1_down.py|services/zmq/forward.py|services/zmq/lidar_forward.py" || true)
   for pid in "${pids[@]}"; do
     [[ -z "${pid}" || "${pid}" -eq $$ || "${pid}" -eq "${PPID:-0}" ]] && continue
     kill -9 "${pid}" 2>/dev/null || true
