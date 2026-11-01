@@ -9,6 +9,8 @@ function zmqClock(ts) {
 function ZmqTab() {
   const [snap, setSnap] = React.useState(null);
   const [fault, setFault] = React.useState("");
+  const [modeBusy, setModeBusy] = React.useState(false);
+  const [modeFault, setModeFault] = React.useState("");
 
   React.useEffect(() => {
     let stop = false;
@@ -40,6 +42,19 @@ function ZmqTab() {
   const sources = Array.isArray(odom.sources) ? odom.sources : [];
   const forwardUp = !!forward.ok;
   const listenUp = !!(snap && snap.running);
+  const sniffing = lidar.mode === "sniff";
+
+  async function setLidarMode(mode) {
+    setModeBusy(true);
+    setModeFault("");
+    try {
+      await bridgeSend("/zmq/lidar", { method: "POST", body: JSON.stringify({ mode: mode }) });
+    } catch (err) {
+      setModeFault(err.message || "Could not set lidar mode");
+    } finally {
+      setModeBusy(false);
+    }
+  }
 
   const kpis = [
     { label: "Lidar", kicker: "pkt/s", value: forwardUp ? fmtNumber(lidar.pkt_s) : "—", icon: "signal", bad: !forwardUp || !lidar.up },
@@ -56,9 +71,21 @@ function ZmqTab() {
         <Card>
           <div className="panel-head">
             <SectionLabel kicker={forward.pub || "pub"}>Forward</SectionLabel>
-            <StatusDot state={forwardUp ? "ok" : "bad"} label={forwardUp ? "Live" : "Down"} />
+            <div className="act-row" style={{ marginTop: 0 }}>
+              <button
+                type="button"
+                className={"act-btn" + (sniffing ? " act-btn-primary" : "")}
+                disabled={modeBusy}
+                title="Copy lidar packets from the interface without binding the UDP port"
+                onClick={() => setLidarMode(sniffing ? "bind" : "sniff")}
+              >
+                {sniffing ? "Sniffing" : "Sniffer"}
+              </button>
+              <StatusDot state={forwardUp ? "ok" : "bad"} label={forwardUp ? "Live" : "Down"} />
+            </div>
           </div>
           <p className="console-path">{forward.push || "Waiting for the forwarder"}</p>
+          {modeFault ? <p className="pad-hint" style={{ textAlign: "left" }}>{modeFault}</p> : null}
           {forward.error ? <p className="pad-hint" style={{ textAlign: "left" }}>{forward.error}</p> : null}
           <div className="table-scroll">
             <table className="dtable">
@@ -72,7 +99,7 @@ function ZmqTab() {
               </thead>
               <tbody>
                 <tr>
-                  <td>Lidar {lidar.bind || ""}</td>
+                  <td>Lidar {sniffing ? ("sniff " + (lidar.iface || lidar.bind || "")) : (lidar.bind || "")}</td>
                   <td className="num">{fmtNumber(lidar.pkt_s)} pkt/s</td>
                   <td className="num">{fmtNumber(lidar.drops)}</td>
                   <td className="num">{fmtNumber(lidar.total)}</td>

@@ -1009,6 +1009,15 @@ function ControlTab({ state, actions }) {
     linkTitle = robotLink.fsm_name || "Robot answering";
   }
   const shown = driveMode === "sport" ? state.sport || {} : state.stick || {};
+  const battery = (state.health && state.health.battery) || null;
+  const batteryLive = !!(battery && battery.up && battery.soc != null);
+  let batteryTone = "";
+  if (batteryLive) {
+    batteryTone = battery.soc <= 15 ? " is-bad" : battery.soc <= 30 ? " is-warn" : " is-ok";
+  }
+  const batteryTitle = batteryLive
+    ? ("SOH " + battery.soh + "% · " + battery.cycle + " cycles")
+    : "Waiting for BMS";
 
   function knobStyle(stick) {
     return {
@@ -1039,6 +1048,25 @@ function ControlTab({ state, actions }) {
           {state.notice ? (
             <p className="drive-notice"><span className="feed-badge feed-badge-warn">Fail</span>{state.notice}</p>
           ) : null}
+          <div className="mode-body">
+          <div className={"status-col" + batteryTone} title={batteryTitle}>
+            <div className="status-row">
+              <span className="status-k">Charge</span>
+              <span className="status-v">{batteryLive ? battery.soc + "%" : "—"}</span>
+            </div>
+            <div className="status-row">
+              <span className="status-k">Voltage</span>
+              <span className="status-v">{batteryLive ? Number(battery.voltage_v).toFixed(1) + " V" : "—"}</span>
+            </div>
+            <div className="status-row">
+              <span className="status-k">Current</span>
+              <span className="status-v">{batteryLive ? Number(battery.current_a).toFixed(1) + " A" : "—"}</span>
+            </div>
+            <div className="status-row">
+              <span className="status-k">Temp</span>
+              <span className="status-v">{batteryLive && battery.temp_c != null ? battery.temp_c + "°C" : "—"}</span>
+            </div>
+          </div>
           <div className="mode-tiles">
             {BRINGUP.map((mode) => (
               <ModeChoice
@@ -1051,6 +1079,7 @@ function ControlTab({ state, actions }) {
                 onSelect={selectMode}
               />
             ))}
+          </div>
           </div>
         </Card>
         <Card className="board-card drive-card">

@@ -11,8 +11,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import select
 import socket
 import struct
+import subprocess
 import threading
 import time
 
@@ -88,10 +90,233 @@ def _parse_odom(kind: str, msg) -> dict:
     }
 
 
+def _iface_for_ip(host: str) -> str:
+    try:
+        import fcntl
+
+        for iface in os.listdir("/sys/class/net"):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                packed = fcntl.ioctl(sock.fileno(), 0x8915, struct.pack("256s", iface.encode()[:15]))
+            except OSError:
+                continue
+            finally:
+                sock.close()
+            if socket.inet_ntoa(packed[20:24]) == host:
+                return iface
+    except OSError:
+        pass
+    return ""
+
+
+def _read_lidar_mode(path: str) -> str:
+    try:
+        text = open(path, encoding="utf-8").read().strip().lower()
+    except OSError:
+        return "bind"
+    return "sniff" if text == "sniff" else "bind"
+
+
+def _udp_payload(frame: bytes, host: str, port: int) -> bytes:
+    if len(frame) < 42:
+        return b""
+    eth_type = struct.unpack_from("!H", frame, 12)[0]
+    offset = 14
+    if eth_type == 0x8100 and len(frame) >= 46:
+        eth_type = struct.unpack_from("!H", frame, 16)[0]
+        offset = 18
+    if eth_type != 0x0800 or len(frame) < offset + 28:
+        return b""
+    version = frame[offset] >> 4
+    if version != 4 or frame[offset + 9] != 17:
+        return b""
+    ihl = (frame[offset] & 0x0F) * 4
+    udp_off = offset + ihl
+    if ihl < 20 or len(frame) < udp_off + 8:
+        return b""
+    dst_ip = socket.inet_ntoa(frame[offset + 16:offset + 20])
+    dst_port = struct.unpack_from("!H", frame, udp_off + 2)[0]
+    if dst_ip != host or dst_port != port:
+        return b""
+    length = struct.unpack_from("!H", frame, udp_off + 4)[0]
+    if length < 8:
+        return b""
+    return frame[udp_off + 8:udp_off + length]
+
+
+class LidarCapture:
+    """Bind the Livox UDP port, or copy those packets with dumpcap."""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.mode = ""
+        self.iface = ""
+        self.error = ""
+        self.sock = None
+        self.proc = None
+        self.buf = b""
+        self.link = 1
+        self.header = False
+
+    def _alive(self) -> bool:
+        if self.sock is not None:
+            return True
+        return self.proc is not None and self.proc.poll() is None
+
+    def close(self) -> None:
+        sock = self.sock
+        self.sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        proc = self.proc
+        self.proc = None
+        self.buf = b""
+        self.header = False
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    def ensure(self, mode: str) -> None:
+        if mode == self.mode and (self._alive() or self.error):
+            return
+        self.close()
+        self.mode = mode
+        self.error = ""
+        try:
+            if mode == "sniff":
+                self._open_sniff()
+            else:
+                self.sock = self._open_bind()
+        except OSError as exc:
+            self.sock = None
+            self.error = str(exc)
+            print(f"lidar {mode} failed: {exc}", flush=True)
+
+    def _open_bind(self) -> socket.socket:
+        self.iface = ""
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp.bind((self.host, self.port))
+        udp.settimeout(0.5)
+        print(f"lidar bind {self.host}:{self.port}", flush=True)
+        return udp
+
+    def _open_sniff(self) -> None:
+        iface = _iface_for_ip(self.host) or _dds_interface()
+        self.iface = iface
+        dumpcap = "/usr/bin/dumpcap"
+        if not os.access(dumpcap, os.X_OK):
+            raise OSError(
+                "dumpcap is not executable; restart the forwarder in group wireshark"
+            )
+        cmd = [
+            dumpcap, "-P", "-q",
+            "-i", iface,
+            "-f", f"udp dst port {self.port} and dst host {self.host}",
+            "-w", "-",
+        ]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.4)
+        if self.proc.poll() is not None:
+            err = self.proc.stderr.read().decode("utf-8", "replace").strip()
+            raise OSError(err or f"dumpcap exited {self.proc.returncode}")
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        os.set_blocking(self.proc.stderr.fileno(), False)
+        print(f"lidar sniff {iface} {self.host}:{self.port} via dumpcap", flush=True)
+
+    def _drain_stderr(self) -> None:
+        if self.proc is None or self.proc.stderr is None:
+            return
+        try:
+            self.proc.stderr.read()
+        except BlockingIOError:
+            pass
+
+    def _read_stdout(self) -> None:
+        if self.proc is None or self.proc.stdout is None:
+            return
+        try:
+            chunk = self.proc.stdout.read(65536)
+        except BlockingIOError:
+            return
+        if chunk:
+            self.buf += chunk
+
+    def _pop_packet(self) -> bytes:
+        if not self.header:
+            if len(self.buf) < 24:
+                return b""
+            magic, _maj, _min, _zone, _sig, _snap, link = struct.unpack_from("<IHHIIII", self.buf, 0)
+            if magic != 0xA1B2C3D4:
+                raise OSError(f"unexpected pcap magic {magic:#x}")
+            self.link = link
+            self.buf = self.buf[24:]
+            self.header = True
+        if len(self.buf) < 16:
+            return b""
+        _ts, _us, incl, _orig = struct.unpack_from("<IIII", self.buf, 0)
+        if incl > 65535 or len(self.buf) < 16 + incl:
+            return b""
+        frame = self.buf[16:16 + incl]
+        self.buf = self.buf[16 + incl:]
+        if self.link != 1:
+            return b""
+        return _udp_payload(frame, self.host, self.port)
+
+    def _recv_pcap(self) -> bytes:
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            self._drain_stderr()
+            if self.proc.poll() is not None:
+                raise OSError(f"dumpcap exited {self.proc.returncode}")
+            try:
+                payload = self._pop_packet()
+            except OSError as exc:
+                self.error = str(exc)
+                self.close()
+                print(f"lidar sniff failed: {exc}", flush=True)
+                return b""
+            if payload:
+                return payload
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+            select.select([self.proc.stdout], [], [], min(0.2, remain))
+            self._read_stdout()
+        try:
+            return self._pop_packet()
+        except OSError as exc:
+            self.error = str(exc)
+            self.close()
+            print(f"lidar sniff failed: {exc}", flush=True)
+            return b""
+
+    def recv(self) -> bytes:
+        if self.proc is not None:
+            return self._recv_pcap()
+        if self.sock is None:
+            time.sleep(0.5)
+            return b""
+        try:
+            data, _addr = self.sock.recvfrom(65535)
+            return data
+        except socket.timeout:
+            return b""
+
+
 class ForwardStats:
     def __init__(self):
         self.lock = threading.Lock()
         self.lidar_error = ""
+        self.lidar_mode = "bind"
+        self.lidar_iface = ""
         self.odom_error = ""
         self.lidar_pkts = 0
         self.lidar_pts = 0
@@ -193,6 +418,7 @@ def main() -> None:
     port = int(os.environ.get("LIDAR_UDP_PORT", "56301"))
     endpoint = os.environ.get("ZMQ_LIDAR_PUSH", "tcp://10.1.137.133:5601").strip()
     status_path = os.environ.get("ZMQ_FORWARD_STATUS", "/tmp/g1-zmq-forward.json")
+    mode_path = os.environ.get("ZMQ_LIDAR_MODE", "/tmp/g1-zmq-lidar.mode")
     pub = os.environ.get("ZMQ_SERVER_PUB", "tcp://10.1.137.133:5600").strip()
     iface = _dds_interface()
 
@@ -205,30 +431,20 @@ def main() -> None:
     stats = ForwardStats()
     _start_odom(push, stats, iface)
 
-    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        udp.bind((host, port))
-    except OSError as exc:
-        stats.lidar_error = str(exc)
-        udp.close()
-        udp = None
-        print(f"lidar bind {host}:{port} failed: {exc}", flush=True)
-    else:
-        udp.settimeout(0.5)
-        print(f"lidar udp {host}:{port} -> {endpoint}", flush=True)
-
+    capture = LidarCapture(host, port)
     window = time.monotonic()
+    mode_checked = 0.0
     try:
         while True:
-            data = b""
-            if udp is not None:
-                try:
-                    data, _addr = udp.recvfrom(65535)
-                except socket.timeout:
-                    data = b""
-            else:
-                time.sleep(0.5)
+            now = time.monotonic()
+            if now - mode_checked >= 0.25:
+                mode_checked = now
+                capture.ensure(_read_lidar_mode(mode_path))
+                with stats.lock:
+                    stats.lidar_mode = capture.mode or "bind"
+                    stats.lidar_iface = capture.iface
+                    stats.lidar_error = capture.error
+            data = capture.recv()
             if data:
                 points = struct.unpack_from("<H", data, 5)[0] if len(data) >= 7 else 0
                 with stats.lock:
@@ -254,15 +470,14 @@ def main() -> None:
             window = now
             _write_status(status_path, body)
             print(
-                "forward lidar %d pkt/s  %d pt/s | odom %d msg/s"
-                % (round(lidar_rate), round(point_rate), round(odom_rate)),
+                "forward %s lidar %d pkt/s  %d pt/s | odom %d msg/s"
+                % (stats.lidar_mode, round(lidar_rate), round(point_rate), round(odom_rate)),
                 flush=True,
             )
     finally:
+        capture.close()
         push.close(linger=0)
         ctx.term()
-        if udp is not None:
-            udp.close()
 
 
 def _status_body(stats, host, port, endpoint, pub, iface, lidar_rate, point_rate, odom_rate) -> dict:
@@ -287,7 +502,9 @@ def _status_body(stats, host, port, endpoint, pub, iface, lidar_rate, point_rate
         "push": endpoint,
         "lidar": {
             "up": not stats.lidar_error,
+            "mode": stats.lidar_mode,
             "bind": f"{host}:{port}",
+            "iface": stats.lidar_iface,
             "pkt_s": round(lidar_rate),
             "pt_s": round(point_rate),
             "drops": int(stats.lidar_drop),

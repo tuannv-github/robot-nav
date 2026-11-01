@@ -90,11 +90,43 @@ WPA_SOCKET = "/run/wpa_supplicant"
 INTERFACE = "wlan0"
 TARGET_SSID = "FCCLab"
 
-# The 3 Physical Mesh Units in FCCLab (5 GHz)
+
+def detect_interface():
+    """Prefer the Wi-Fi interface that is already associated. The G1 dongle is not wlan0."""
+    global INTERFACE
+    out = run_cmd("iw dev")
+    current = None
+    connected = None
+    names = []
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Interface "):
+            current = stripped.split()[1]
+            names.append(current)
+        elif current and stripped.startswith("ssid "):
+            connected = current
+    INTERFACE = connected or (names[0] if names else INTERFACE)
+    return INTERFACE
+
+
+def wpa_ready():
+    return os.path.exists(os.path.join(WPA_SOCKET, INTERFACE))
+
+
+def quality_to_dbm(value):
+    """NetworkManager reports 0–100. That scale is (dBm + 100) * 100 / 60, clamped."""
+    quality = int(value)
+    if quality < 0:
+        return quality
+    quality = max(0, min(100, quality))
+    return int(round(quality * 0.6 - 100))
+
+# FCCLab 5 GHz: one main Deco and three satellites. Channel follows the live beacon.
 KNOWN_MESH_NODES = {
-    "18:69:45:84:FB:EB": {"name": "Mesh Node 1 (Main)", "chan": "CH 36 (5 GHz)", "freq": "5180"},
-    "18:69:45:84:FC:45": {"name": "Mesh Node 2 (Satellite 1)", "chan": "CH 36 (5 GHz)", "freq": "5180"},
-    "18:69:45:84:FB:0D": {"name": "Mesh Node 3 (Satellite 2)", "chan": "CH 36 (5 GHz)", "freq": "5180"},
+    "18:69:45:84:FB:EB": {"name": "Mesh Node 1 (Main)", "chan": "CH 44 (5 GHz)", "freq": "5220"},
+    "18:69:45:84:FC:45": {"name": "Mesh Node 2 (Satellite 1)", "chan": "CH 44 (5 GHz)", "freq": "5220"},
+    "18:69:45:84:FB:0D": {"name": "Mesh Node 3 (Satellite 2)", "chan": "CH 44 (5 GHz)", "freq": "5220"},
+    "20:E1:5D:B6:6C:CF": {"name": "Mesh Node 4 (Satellite 3)", "chan": "CH 44 (5 GHz)", "freq": "5220"},
 }
 
 def run_cmd(cmd, timeout=2.5):
@@ -155,41 +187,74 @@ def signal_bar(dbm_val, is_lost=False):
         return f"{dbm_val} dBm"
 
 def get_current_status():
-    status_out = run_cmd(f"sudo wpa_cli -p {WPA_SOCKET} -i {INTERFACE} status")
+    iface = detect_interface()
     info = {}
-    for line in status_out.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            info[k.strip()] = v.strip()
-    
-    # Real-time active link signal poll (instantaneous driver RSSI)
-    sig_poll = run_cmd(f"sudo wpa_cli -p {WPA_SOCKET} -i {INTERFACE} signal_poll")
-    for line in sig_poll.splitlines():
-        if line.startswith("RSSI="):
-            info["link_signal"] = line.split("=")[1].strip()
+    if wpa_ready():
+        status_out = run_cmd(f"sudo wpa_cli -p {WPA_SOCKET} -i {iface} status")
+        for line in status_out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                info[k.strip()] = v.strip()
+        sig_poll = run_cmd(f"sudo wpa_cli -p {WPA_SOCKET} -i {iface} signal_poll")
+        for line in sig_poll.splitlines():
+            if line.startswith("RSSI="):
+                info["link_signal"] = line.split("=")[1].strip()
 
-    link_out = run_cmd(f"iw dev {INTERFACE} link")
+    link_out = run_cmd(f"iw dev {iface} link")
     for line in link_out.splitlines():
-        if "rx bitrate:" in line:
-            info["rx_bitrate"] = line.strip().replace("rx bitrate: ", "")
-        if "tx bitrate:" in line:
-            info["tx_bitrate"] = line.strip().replace("tx bitrate: ", "")
-        if "signal:" in line and "link_signal" not in info:
-            sig_match = re.search(r"(-?\d+)\s*dBm", line)
+        stripped = line.strip()
+        if stripped.startswith("Connected to "):
+            info["bssid"] = stripped.split()[2]
+        elif stripped.startswith("SSID:"):
+            info["ssid"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("freq:"):
+            info["freq"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("signal:"):
+            sig_match = re.search(r"(-?\d+)\s*dBm", stripped)
             if sig_match:
                 info["link_signal"] = sig_match.group(1)
-            else:
-                info["link_signal"] = "-60"
-            
+        elif stripped.startswith("rx bitrate:"):
+            info["rx_bitrate"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("tx bitrate:"):
+            info["tx_bitrate"] = stripped.split(":", 1)[1].strip()
+
+    ip_out = run_cmd(f"ip -4 -o addr show dev {iface}")
+    ip_match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
+    if ip_match:
+        info["ip_address"] = ip_match.group(1)
     return info
 
+
+def scan_nmcli(ssid_filter):
+    """Neighbor list from NetworkManager. BSSIDs are escaped as \\: in terse output."""
+    raw = run_cmd("nmcli -t -f SSID,BSSID,FREQ,SIGNAL dev wifi")
+    found = {}
+    for line in raw.splitlines():
+        escaped = line.replace("\\:", "\x1f")
+        parts = escaped.split(":")
+        if len(parts) < 4:
+            continue
+        ssid = parts[0]
+        if ssid != ssid_filter:
+            continue
+        bssid = parts[1].replace("\x1f", ":").upper()
+        freq = parts[2].split()[0]
+        try:
+            if int(freq) < 5000:
+                continue
+            signal = str(quality_to_dbm(parts[3]))
+        except ValueError:
+            continue
+        found[bssid] = {"signal": signal, "age": 0, "freq": freq}
+    return found
+
 def scan_all_mesh_nodes(curr_status, ssid_filter=TARGET_SSID, five_ghz_only=True, passive=True):
-    curr_freq = curr_status.get("freq", "5180")
+    curr_freq = curr_status.get("freq", "5220")
     curr_bssid = curr_status.get("bssid", "").upper()
 
-    # Non-blocking scan trigger (0ms request to kernel to refresh background 5180MHz beacons without blocking UI)
+    # Refresh beacons on the channel the radio is actually using.
     run_cmd(f"sudo iw dev {INTERFACE} scan trigger freq {curr_freq} > /dev/null 2>&1", timeout=0.5)
-    
+
     # Parse kernel iw scan dump for fresh over-the-air RSSIs (handles mesh alias MACs and bypasses stale associated cache)
     scanned_data = {}
     raw_dump = run_cmd(f"sudo iw dev {INTERFACE} scan dump")
@@ -217,14 +282,19 @@ def scan_all_mesh_nodes(curr_status, ssid_filter=TARGET_SSID, five_ghz_only=True
                         if main_mac not in scanned_data or not is_assoc:
                             scanned_data[main_mac.upper()] = {
                                 "signal": sig,
-                                "age": max(0, int(last_seen_ms / 1000))
+                                "age": max(0, int(last_seen_ms / 1000)),
+                                "freq": curr_freq,
                             }
             except Exception:
                 pass
             
+    for mac, sample in scan_nmcli(ssid_filter).items():
+        if mac not in scanned_data:
+            scanned_data[mac] = sample
+
     # Fallback to wpa_cli BSS for any missing nodes
     for mac in KNOWN_MESH_NODES.keys():
-        if mac.upper() not in scanned_data:
+        if mac.upper() not in scanned_data and wpa_ready():
             bss_out = run_cmd(f"sudo wpa_cli -p {WPA_SOCKET} -i {INTERFACE} BSS {mac.lower()}")
             level = None
             age = 999
@@ -242,7 +312,8 @@ def scan_all_mesh_nodes(curr_status, ssid_filter=TARGET_SSID, five_ghz_only=True
             if level is not None and age <= 30:
                 scanned_data[mac.upper()] = {
                     "signal": level,
-                    "age": age
+                    "age": age,
+                    "freq": curr_freq,
                 }
             
     # Always assemble all 3 known mesh nodes
@@ -251,7 +322,8 @@ def scan_all_mesh_nodes(curr_status, ssid_filter=TARGET_SSID, five_ghz_only=True
     for bssid, meta in KNOWN_MESH_NODES.items():
         is_active = (bssid == curr_bssid)
         node_name = meta["name"]
-        chan_str = meta["chan"]
+        node_freq = scanned_data.get(bssid, {}).get("freq") or (curr_status.get("freq") if curr_status.get("freq") else None)
+        chan_str = freq_to_chan(node_freq) if node_freq else meta["chan"]
         
         if is_active:
             # Use fresh over-the-air beacon RSSI for consistent baseline across all nodes, fallback to active link_signal
@@ -315,31 +387,58 @@ def append_to_ho_logfile(plain_msg):
     except Exception:
         pass
 
+def ensure_sudo():
+    """NetworkManager will not change the BSSID without root. Ask once per terminal."""
+    if subprocess.call(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+        return True
+    print("\nWi-Fi roam needs sudo. Enter your password once.", flush=True)
+    return subprocess.call(["sudo", "-v"]) == 0
+
+
 def perform_roam(target_bssid, verbose=False):
     target_bssid = target_bssid.lower()
+    if not re.fullmatch(r"[0-9a-f:]{17}", target_bssid):
+        return False
     t_stamp = time.strftime("%H:%M:%S")
     target_name = KNOWN_MESH_NODES.get(target_bssid.upper(), {}).get("name", target_bssid)
 
     if verbose:
         print(f"\n\033[96m[*] [{t_stamp}] Triggering instant Handover (HO) to BSSID: {target_bssid} ({target_name})...\033[0m")
 
-    out = run_cmd(f"sudo wpa_cli -p {WPA_SOCKET} -i {INTERFACE} roam {target_bssid}")
-    
+    iface = detect_interface()
+    if wpa_ready():
+        cmd = ["sudo", "-n", "wpa_cli", "-p", WPA_SOCKET, "-i", iface, "roam", target_bssid]
+    else:
+        # nmcli matches the scan list only when the BSSID is uppercase, and network-control is root-only here.
+        cmd = ["sudo", "-n", "nmcli", "device", "wifi", "connect", TARGET_SSID, "bssid", target_bssid.upper(), "ifname", iface]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+        out = (res.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        out = "roam timed out"
+    except Exception as exc:
+        out = str(exc)
+
     if verbose:
-        print(f"\033[90m    wpa_cli response: {out}\033[0m")
+        print(f"\033[90m    roam response: {out}\033[0m")
 
     time.sleep(1.0)
-    
+
     curr = get_current_status()
     success = (curr.get("bssid", "").lower() == target_bssid)
+    if not success:
+        perform_roam.last_error = out or "BSSID did not change"
 
     if verbose:
         if success:
             print(f"\033[92m[✓] Handover SUCCESS! Now connected to {target_name} ({target_bssid})\033[0m")
         else:
-            print(f"\033[91m[!] Handover to {target_bssid} failed or pending.\033[0m")
+            print(f"\033[91m[!] Handover to {target_bssid} failed or pending. {perform_roam.last_error}\033[0m")
 
     return success
+
+
+perform_roam.last_error = ""
 
 def check_and_execute_auto_roam(bss_list, curr_status, threshold=-65, min_delta=8, ho_log_history=None):
     active_item = None
@@ -381,16 +480,20 @@ def check_and_execute_auto_roam(bss_list, curr_status, threshold=-65, min_delta=
         t_stamp = time.strftime("%H:%M:%S")
         
         success = perform_roam(target_bssid, verbose=False)
-        
+
         if success:
             event_str = f"\033[1;93m[{t_stamp}]\033[0m \033[92m{short_from}\033[0m \033[1;36m-->\033[0m \033[1;92m{short_target}\033[0m"
             plain_str = f"Auto-Roam: {short_from} ({active_sig} dBm) -> {short_target} ({best_candidate_sig} dBm) SUCCESS"
             append_to_ho_logfile(plain_str)
-            
+
             if ho_log_history is not None:
                 ho_log_history.append(event_str)
 
             return True, target_name, event_str
+
+        reason = perform_roam.last_error.replace("\n", " ")[:120]
+        event_str = f"\033[1;91m[{t_stamp}] {short_from} --> {short_target} failed: {reason}\033[0m"
+        return False, target_name, event_str
 
     return False, None, None
 
@@ -437,11 +540,11 @@ def display_dashboard(ssid_filter=TARGET_SSID, five_ghz_only=True, auto_roam=Fal
     bss_list = scan_all_mesh_nodes(current, ssid_filter, five_ghz_only)
 
     lines = []
-    lines.append("\033[H\033[1;36m" + "="*96)
+    lines.append("\033[1;36m" + "="*96)
     lines.append("       📶  UNITREE GO2 WI-FI 5GHz MESH SIGNAL & HANDOVER (HO) MONITOR")
     lines.append("="*96 + "\033[0m")
     
-    auto_tag = f"\033[1;92mACTIVE\033[0m (Thresh: {threshold}dBm, MinDelta: +{min_delta}dB)" if auto_roam else "\033[90mDISABLED (pass -a or --auto-roam to enable)\033[0m"
+    auto_tag = f"\033[1;92mACTIVE\033[0m (Thresh: {threshold}dBm, MinDelta: +{min_delta}dB)" if auto_roam else "\033[90mDISABLED (--no-auto-roam)\033[0m"
     
     if last_roam_event:
         roam_event_tag = last_roam_event
@@ -512,8 +615,8 @@ def display_dashboard(ssid_filter=TARGET_SSID, five_ghz_only=True, auto_roam=Fal
     lines.append("\033[36m" + "="*88 + "\033[0m")
     lines.append("\033[90m[Live 5GHz Fast Monitor... Press Ctrl+C to exit]\033[0m\n")
 
-    frame_str = "\n".join(lines)
-    print(frame_str)
+    frame_str = "\033[H" + "\n".join(line + "\033[K" for line in lines) + "\033[J"
+    print(frame_str, end="")
     sys.stdout.flush()
 
     broadcast_udp_frame(frame_str, udp_port)
@@ -529,25 +632,31 @@ def main():
     parser.add_argument("--once", action="store_true", help="Run a single snapshot and exit")
     parser.add_argument("--interval", "-i", type=float, default=1.0, help="Refresh interval in seconds (default: 1.0)")
     parser.add_argument("--roam", "-r", type=str, help="Target BSSID to roam to immediately")
-    parser.add_argument("--auto-roam", "-a", action="store_true", help="Enable smart automatic roaming when a better AP is available")
+    parser.add_argument("--auto-roam", "-a", action="store_true", help="Roam to a stronger BSSID. This is already the default")
+    parser.add_argument("--no-auto-roam", action="store_true", help="Stay on the current BSSID")
     parser.add_argument("--threshold", "-t", type=int, default=-65, help="RSSI threshold in dBm to trigger auto-roam (default: -65)")
     parser.add_argument("--min-delta", "-d", type=int, default=8, help="Minimum RSSI improvement in dB required to auto-roam (default: 8)")
     parser.add_argument("--cooldown", "-c", type=float, default=5.0, help="Minimum seconds between auto-roam triggers (default: 5.0)")
     parser.add_argument("--udp-port", type=int, default=UDP_PORT_DEFAULT, help="UDP IPC broadcast port (default: 9999)")
     parser.add_argument("--socket-path", type=str, default=UNIX_SOCKET_PATH_DEFAULT, help="Unix Domain Socket IPC path (default: /tmp/go2_wifi_mesh.sock)")
     args = parser.parse_args()
+    auto_roam = not args.no_auto_roam
 
     unix_server = UnixSocketServer(args.socket_path)
     ho_log_history = load_ho_history_from_file()
 
+    if auto_roam or args.roam:
+        if not wpa_ready():
+            ensure_sudo()
+
     if args.roam:
-        perform_roam(args.roam)
+        perform_roam(args.roam, verbose=True)
         return
 
     five_ghz_only = not args.all_bands
 
     if args.once:
-        display_dashboard(args.ssid, five_ghz_only, args.auto_roam, args.threshold, args.min_delta, None, ho_log_history, args.udp_port, unix_server)
+        display_dashboard(args.ssid, five_ghz_only, auto_roam, args.threshold, args.min_delta, None, ho_log_history, args.udp_port, unix_server)
         return
 
     last_roam_time = 0
@@ -558,13 +667,14 @@ def main():
 
     try:
         while True:
-            bss_list, curr_status = display_dashboard(args.ssid, five_ghz_only, args.auto_roam, args.threshold, args.min_delta, last_roam_event, ho_log_history, args.udp_port, unix_server)
-            
-            if args.auto_roam and (time.time() - last_roam_time >= args.cooldown):
+            bss_list, curr_status = display_dashboard(args.ssid, five_ghz_only, auto_roam, args.threshold, args.min_delta, last_roam_event, ho_log_history, args.udp_port, unix_server)
+
+            if auto_roam and (time.time() - last_roam_time >= args.cooldown):
                 roamed, target, event_str = check_and_execute_auto_roam(bss_list, curr_status, args.threshold, args.min_delta, ho_log_history)
-                if roamed:
+                if event_str:
                     last_roam_time = time.time()
                     last_roam_event = event_str
+                if roamed:
                     time.sleep(1.0)
             
             time.sleep(args.interval)

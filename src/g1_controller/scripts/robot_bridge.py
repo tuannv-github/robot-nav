@@ -1296,6 +1296,57 @@ class LocalJoystick:
                 self.robot.stop_motion(source="js")
 
 
+class BatteryFeed:
+    """Latest G1 BMS sample from rt/lf/bmsstate. Read-only."""
+
+    TOPIC = "rt/lf/bmsstate"
+
+    def __init__(self):
+        self.error = ""
+        self._lock = threading.Lock()
+        self._sample = None
+        self._mono = 0.0
+        self._sub = None
+
+    def start(self) -> None:
+        from unitree_sdk2py.core.channel import ChannelSubscriber
+        from unitree_sdk2py.idl.unitree_hg.msg.dds_ import BmsState_
+
+        sub = ChannelSubscriber(self.TOPIC, BmsState_)
+        sub.Init(self._on, 1)
+        self._sub = sub
+
+    def _on(self, msg) -> None:
+        try:
+            temps = [int(item) for item in msg.temperature if -20 < int(item) < 120]
+            voltage_mv = int(msg.bmsvoltage[0]) if msg.bmsvoltage else 0
+            sample = {
+                "soc": int(msg.soc),
+                "soh": int(msg.soh),
+                "voltage_v": round(voltage_mv / 1000.0, 2),
+                "current_a": round(int(msg.current) / 1000.0, 2),
+                "temp_c": max(temps) if temps else None,
+                "cycle": int(msg.cycle),
+            }
+        except Exception:
+            return
+        with self._lock:
+            self._sample = sample
+            self._mono = time.monotonic()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            sample = None if self._sample is None else dict(self._sample)
+            mono = self._mono
+        if sample is None:
+            return {"up": False, "soc": None, "error": self.error}
+        age = max(0.0, time.monotonic() - mono)
+        sample["up"] = age < 5.0
+        sample["age_s"] = round(age, 2)
+        sample["error"] = ""
+        return sample
+
+
 class G1Controller:
     def __init__(self, network_interface: str):
         self.network_interface = network_interface
@@ -1318,6 +1369,7 @@ class G1Controller:
         self.arm_client = None
         self.arm_actions = []
         self.odom = OdomFeed()
+        self.battery = BatteryFeed()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._hold = {
@@ -1372,6 +1424,10 @@ class G1Controller:
             self.odom.start()
         except Exception as exc:
             self.odom.error = str(exc)
+        try:
+            self.battery.start()
+        except Exception as exc:
+            self.battery.error = str(exc)
         self.ready = True
         self.actions.record(
             "system",
@@ -1498,6 +1554,7 @@ class G1Controller:
             "fsm_id": robot_link["fsm_id"],
             "fsm_name": robot_link["fsm_name"],
             "robot_link": robot_link,
+            "battery": self.battery.snapshot(),
             "drive": {
                 "mode": hold["mode"],
                 "lx": hold["lx"],
@@ -1870,6 +1927,22 @@ def _openapi_spec() -> dict:
             "/fsm": {"get": op("Status", "Current FSM id")},
             "/odom": {"get": op("Status", "Latest sample from each odometry topic")},
             "/zmq": {"get": op("Status", "ZMQ forward rates and received control messages")},
+            "/zmq/lidar": {
+                "post": op(
+                    "Status",
+                    "Switch lidar capture between UDP bind and interface sniffer",
+                    requestBody={
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"mode": {"type": "string", "enum": ["bind", "sniff"]}},
+                                }
+                            }
+                        }
+                    },
+                )
+            },
             "/logs": {"get": op("Status", "Controlled-action log")},
             "/wireless": {
                 "post": op(
@@ -2165,6 +2238,26 @@ def build_app(robot: G1Controller):
 
     async def zmq_get(_request: Request):
         return JSONResponse(_zmq_snapshot(robot))
+
+    async def zmq_lidar_mode(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "JSON object required"}, status_code=400)
+        mode = str(body.get("mode") or "").strip().lower()
+        if mode not in ("bind", "sniff"):
+            return JSONResponse({"detail": "mode must be bind or sniff"}, status_code=400)
+        path = os.environ.get("ZMQ_LIDAR_MODE", "/tmp/g1-zmq-lidar.mode")
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(mode + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=500)
+        return JSONResponse({"ok": True, "mode": mode})
 
     async def odom_get(_request: Request):
         return JSONResponse(robot.odom.snapshot())
@@ -2575,6 +2668,7 @@ def build_app(robot: G1Controller):
         Route("/health", health, methods=["GET"]),
         Route("/odom", odom_get, methods=["GET"]),
         Route("/zmq", zmq_get, methods=["GET"]),
+        Route("/zmq/lidar", zmq_lidar_mode, methods=["POST"]),
         Route("/wireless", wireless, methods=["POST"]),
         Route("/cmd_vel", cmd_vel, methods=["POST"]),
         Route("/cmd_vel/stop", cmd_vel_stop, methods=["POST"]),

@@ -146,7 +146,16 @@ if [[ -f "${VIDEO_DOWN}" ]]; then
 fi
 if [[ -f "${ZMQ_FORWARD}" ]]; then
   echo "Starting ZMQ forward lidar+odom -> ${ZMQ_LIDAR_PUSH}"
-  nohup "${PYTHON}" "${ZMQ_FORWARD}" >/tmp/g1-zmq-forward.log 2>&1 &
+  # dumpcap is executable by group wireshark. A login from before that
+  # membership was added does not have the group until the process is restarted in it.
+  if id -nG "${USER}" 2>/dev/null | tr ' ' '\n' | grep -qx wireshark \
+      && ! id -nG | tr ' ' '\n' | grep -qx wireshark \
+      && [[ -x /usr/bin/dumpcap ]] && command -v sg >/dev/null 2>&1; then
+    echo "  forwarder group wireshark (lidar sniffer)"
+    nohup sg wireshark -c "exec $(printf '%q' "${PYTHON}") $(printf '%q' "${ZMQ_FORWARD}")" >/tmp/g1-zmq-forward.log 2>&1 &
+  else
+    nohup "${PYTHON}" "${ZMQ_FORWARD}" >/tmp/g1-zmq-forward.log 2>&1 &
+  fi
 fi
 
 if [[ -f "${PROJECT_DIR}/install/setup.bash" ]] && command -v ros2 >/dev/null 2>&1; then
