@@ -344,30 +344,29 @@ function VideoTab() {
   }, []);
 
   useEffect(() => {
-    if (!topic) {
-      setTimestampOn(true);
-      return undefined;
-    }
     let stopped = false;
-    fetch("/video/overlay?path=" + encodeURIComponent(topic))
-      .then((response) => response.json())
-      .then((payload) => {
-        if (stopped || !payload.ok) return;
+    async function refresh() {
+      try {
+        const response = await fetch("/video/overlay");
+        const payload = await response.json();
+        if (stopped || !payload.ok || timestampBusy) return;
         setTimestampOn(!!payload.timestamp);
-      })
-      .catch(() => {});
+      } catch (_exc) { /* keep the last shared flag */ }
+    }
+    refresh();
+    const timer = setInterval(refresh, 2000);
     return () => {
       stopped = true;
+      clearInterval(timer);
     };
-  }, [topic]);
+  }, [timestampBusy]);
 
   const setTimestamp = useCallback(async (enabled) => {
-    if (!topic) return;
     const previous = timestampOn;
     setTimestampOn(enabled);
     setTimestampBusy(true);
     try {
-      const response = await fetch("/video/overlay?path=" + encodeURIComponent(topic), {
+      const response = await fetch("/video/overlay", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ timestamp: enabled }),
@@ -386,7 +385,7 @@ function VideoTab() {
     } finally {
       setTimestampBusy(false);
     }
-  }, [topic, timestampOn]);
+  }, [timestampOn]);
 
   const applyControls = useCallback(async (path, body) => {
     setBusy(true);
@@ -484,8 +483,9 @@ function VideoTab() {
         <label className="video-check video-stamp">
           <input
             type="checkbox"
+            aria-label="Timestamp on all streams"
             checked={timestampOn}
-            disabled={!topic || timestampBusy}
+            disabled={timestampBusy}
             onChange={(event) => setTimestamp(event.target.checked)}
           />
           <span>Timestamp</span>

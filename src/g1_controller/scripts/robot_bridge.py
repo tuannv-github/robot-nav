@@ -1986,11 +1986,10 @@ def _openapi_spec() -> dict:
                 )
             },
             "/video/overlay": {
-                "get": op("Video", "Read the burned-in timestamp flag for a topic", parameters=camera_q),
+                "get": op("Video", "Read the burned-in timestamp flag for every stream"),
                 "put": op(
                     "Video",
-                    "Show or hide the burned-in timestamp on a topic",
-                    parameters=camera_q,
+                    "Show or hide the burned-in timestamp on every stream",
                     requestBody={
                         "content": {
                             "application/json": {
@@ -2617,19 +2616,15 @@ def build_app(robot: G1Controller):
             return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=500)
         return JSONResponse(payload)
 
-    async def video_overlay_get(request: Request):
+    async def video_overlay_get(_request: Request):
         if _overlay_ctrl is None:
             return JSONResponse(
                 {"ok": False, "error": "video overlay module unavailable"},
                 status_code=503,
             )
-        path = (request.query_params.get("path") or "").strip().strip("/")
-        if not _video_path_ok(path):
-            return JSONResponse({"ok": False, "error": "invalid topic"}, status_code=400)
         return JSONResponse({
             "ok": True,
-            "path": path,
-            "timestamp": _overlay_ctrl.timestamp_enabled(path),
+            "timestamp": _overlay_ctrl.timestamp_enabled(),
         })
 
     async def video_overlay_put(request: Request):
@@ -2638,9 +2633,6 @@ def build_app(robot: G1Controller):
                 {"ok": False, "error": "video overlay module unavailable"},
                 status_code=503,
             )
-        path = (request.query_params.get("path") or "").strip().strip("/")
-        if not _video_path_ok(path):
-            return JSONResponse({"ok": False, "error": "invalid topic"}, status_code=400)
         try:
             body = await request.json()
         except Exception:
@@ -2651,10 +2643,14 @@ def build_app(robot: G1Controller):
                 status_code=400,
             )
         try:
-            enabled = _overlay_ctrl.set_timestamp(path, body["timestamp"])
+            topics = [item["name"] for item in await asyncio.to_thread(_video_topics)]
+        except Exception:
+            topics = []
+        try:
+            enabled = _overlay_ctrl.set_timestamp("", body["timestamp"], topics)
         except ValueError as exc:
-            return JSONResponse({"ok": False, "path": path, "error": str(exc)}, status_code=400)
-        return JSONResponse({"ok": True, "path": path, "timestamp": enabled})
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        return JSONResponse({"ok": True, "timestamp": enabled})
 
     routes = [
         WebSocketRoute(saved_interfaces["ws"]["path"], control_ws),
